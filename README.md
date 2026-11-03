@@ -1,0 +1,51 @@
+# Safari ChatGPT：固定 5.6，保留手动强度
+
+版本：0.1.0。通过已安装的 Safari Userscripts 扩展运行，只匹配 `https://chatgpt.com/*` 的顶层页面。
+
+## 使用
+
+- 没有手动档位记录的聊天默认选择 GPT-5.6 Sol + Medium。
+- 使用 ChatGPT 原生强度滑杆调档。脚本按聊天标识在当前浏览器本机记住档位，刷新和切回聊天时恢复。
+- 新聊天尚无标识时，手动档位暂存在当前标签页；获得聊天标识后再关联。
+- 如果选择或自动跳到其他模型，脚本会在操作空闲后恢复 GPT-5.6 Sol，并保留该聊天的手动档位。
+- 输入、拖动滑杆、使用设置菜单或生成回复期间，脚本会等待。不可用选项、无法识别的控件会停止当前尝试，原因记录在控制台和模型按钮提示中。
+
+脚本只操作模型、强度和设置菜单；不读取聊天正文，不修改网络请求，不自动发送消息，不解锁模型权限。网页最终提供的模型与强度仍受账号可用选项约束。
+
+## 安装位置
+
+本机已确认的 Userscripts 保存目录：
+
+```text
+/Users/mac/Library/Containers/com.userscripts.macos.Userscripts-Extension/Data/Documents/scripts/
+```
+
+将完整的 `ChatGPT_56_Preference.user.js` 放入该目录。打开 Safari 的 Userscripts 弹窗，刷新视图后应出现“ChatGPT 固定 5.6 与手动档位”；刷新 ChatGPT 页面加载新版本。Safari 设置 → 扩展中，Userscripts 需启用且允许访问 chatgpt.com。扩展正常扫描目录，不手动编辑其生成的 manifest.json。
+
+撤销：在 Userscripts 中只停用这个 ChatGPT 脚本，随后刷新 ChatGPT。不要关闭整个扩展，以免影响现有 Poe 脚本。
+
+本机偏好使用 `chatgpt-56-preference-v1:` 前缀，仅保存聊天标识对应的档位数字。清除 ChatGPT 网站存储会清除这些偏好。
+
+## 检查
+
+```sh
+node --check ChatGPT_56_Preference.user.js
+node --test preference.test.cjs
+```
+
+实际 Safari 验收需检查：新聊天默认、手动极高后刷新保留、模拟切到 GPT-6 后恢复 5.6 并保留强度、草稿输入不被打断，以及稳定后不再反复弹菜单。测试只检查页面选项，不发送消息，也不声称验证了服务端实际响应模型。
+
+## 本机验收结果（2026-11-03）
+
+已安装到上述 Userscripts 目录，Safari 设置中确认扩展已启用且允许访问本站。Safari 的扩展弹窗已显示“ChatGPT 固定 5.6 与手动档位”，安装副本与仓库脚本一致。现有 Poe 脚本保留。
+
+| 实际操作 | 结果 |
+| --- | --- |
+| 打开空白新聊天 | 原生菜单勾选 GPT-5.6 Sol，Medium 为第 2 档 |
+| 手动调到极高，刷新并切走再切回 | 仍为 5.6 + 极高；无记录的聊天默认 Medium |
+| 极高时手动切到 GPT-6 | 空闲后恢复勾选 GPT-5.6 Sol，保留极高 |
+| 手动改为 High 后刷新 | 保留 High；滑杆可正常自行调档 |
+| 保留未发送的测试草稿并模拟模型偏移 | 恢复模型后草稿原样保留；只清除了本次测试草稿 |
+| 稳定后观察设置菜单 | 脚本关闭自己打开的菜单，未继续反复弹出 |
+
+脚本语法检查、14 项本地测试及 native Review 均通过。Review 使用 `gpt-6.1-sol / high`，最终未发现需要修复的明确缺陷。全程未发送测试消息；验收仅确认网页控件的实际选择。测试聊天已恢复 Medium。文件未提交、未发布。
