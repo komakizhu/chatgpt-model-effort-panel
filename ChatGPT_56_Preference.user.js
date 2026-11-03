@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 固定 5.6 与手动档位
 // @namespace    local.chatgpt-preference
-// @version      0.1.0
+// @version      0.2.1
 // @description  默认 GPT-5.6 Sol + Medium，纠正模型偏移并按聊天保留手动强度。
 // @match        https://chatgpt.com/*
 // @run-at       document-end
@@ -16,10 +16,17 @@
   if (root && root.document && root.top === root.self) api.start(root);
 })(typeof window === 'undefined' ? null : window, function () {
   'use strict';
-  const VERSION = '0.1.0';
+  const VERSION = '0.2.1';
   const PREFIX = 'chatgpt-56-preference-v1:';
   const PICKER = 'button[aria-label="选择 ChatGPT 模型"],button[aria-label="Select ChatGPT model"]';
   const CHOOSER = '[role="menuitem"][aria-label="选择模型"],[role="menuitem"][aria-label="Choose model"],[role="menuitem"][aria-label="Select model"]';
+  const LEVELS = [
+    { value: 0, label: '低' },
+    { value: 1, label: '中' },
+    { value: 2, label: '高' },
+    { value: 3, label: '极高' },
+    { value: 4, label: '最高' }
+  ];
   const valid = n => Number.isInteger(n) && n >= 0 && n <= 4;
   const normalize = s => String(s || '').replace(/\s+/g, ' ').trim();
   function context(path) {
@@ -72,11 +79,10 @@
     if (doc.documentElement.dataset.chatgpt56Version) return;
     doc.documentElement.dataset.chatgpt56Version = VERSION;
     const prefs = new Preferences(win.localStorage, win.sessionStorage);
-    const born = Date.now();
     let key = context(win.location.pathname), timer, working = false;
     let serial = 0, lastInput = 0, pointerDown = false, composing = false;
     let manualUntil = 0, manualKey = key, manualBaseline = null, manualArmed = false, manualToken = 0;
-    let pendingSend = null, blocked = '', verified = '', previousButton, userOwnsMenu = false;
+    let pendingSend = null, blocked = '', verified = '', previousButton, userOwnsMenu = false, panelUi = null;
     const visible = e => !!e && e.isConnected && e.getClientRects().length > 0 &&
       win.getComputedStyle(e).visibility !== 'hidden';
     const picker = () => [...doc.querySelectorAll(PICKER)].find(visible);
@@ -91,6 +97,101 @@
     const disabled = e => !e || e.matches(':disabled,[aria-disabled="true"],[data-disabled]:not([data-disabled="false"])');
     const signature = button => key + '|' + normalize(button.textContent) + '|' + prefs.desired(key);
     const status = (button, value) => { const current = picker() || button; if (current) { current.setAttribute('data-chatgpt-56-status', value); current.title = '5.6 偏好：' + value; } };
+    function refreshPanel() {
+      if (!panelUi) return;
+      if (context(win.location.pathname) !== key) route();
+      const level = prefs.desired(key);
+      const label = LEVELS[level]?.label || LEVELS[1].label;
+      panelUi.launcher.textContent = '5.6 · ' + label;
+      panelUi.launcher.setAttribute('aria-label', 'GPT-5.6 强度：' + label + '。打开档位设置');
+      panelUi.choices.forEach(button => button.setAttribute('aria-pressed', String(Number(button.dataset.level) === level)));
+    }
+    function mountPanel() {
+      if (panelUi) {
+        if (!panelUi.host.isConnected && doc.body) doc.body.append(panelUi.host);
+        return;
+      }
+      if (!doc.body) { win.setTimeout(mountPanel, 80); return; }
+      if (!doc.createElement || !win.Element?.prototype?.attachShadow) return;
+      const host = doc.createElement('div');
+      host.dataset.chatgpt56Panel = VERSION;
+      const shadow = host.attachShadow({ mode: 'open' });
+      const style = doc.createElement('style');
+      style.textContent = `
+        :host { all: initial; position: fixed; display: block; width: max-content; z-index: 2147483647; right: 16px; bottom: 112px; color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        * { box-sizing: border-box; }
+        button { font: inherit; }
+        .launcher { display: block; min-height: 40px; padding: 0 13px; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; background: #202329; color: #f5f6f8; box-shadow: 0 4px 18px rgba(0,0,0,.26); font-size: 13px; font-weight: 600; cursor: pointer; }
+        .launcher:hover, .launcher:focus-visible { background: #2a3039; outline: 2px solid #80b8ff; outline-offset: 2px; }
+        .panel { position: absolute; right: 0; bottom: calc(100% + 10px); width: min(326px, calc(100vw - 24px)); padding: 15px; border: 1px solid rgba(255,255,255,.14); border-radius: 16px; background: rgba(31,34,40,.98); color: #f4f5f7; box-shadow: 0 12px 36px rgba(0,0,0,.34); backdrop-filter: blur(14px); }
+        .panel[hidden] { display: none; }
+        .heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; font-size: 15px; font-weight: 650; }
+        .close { width: 30px; height: 30px; border: 0; border-radius: 8px; background: transparent; color: #c7cbd2; font-size: 20px; cursor: pointer; }
+        .close:hover, .close:focus-visible { background: #393e47; color: #fff; outline: 2px solid #80b8ff; }
+        .hint { margin: 0 0 13px; color: #b9bec8; font-size: 12px; line-height: 1.45; }
+        .choices { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+        .choice { min-width: 0; min-height: 39px; padding: 0 3px; border: 1px solid #484e59; border-radius: 9px; background: #292d35; color: #e4e7ec; font-size: 12px; cursor: pointer; }
+        .choice:hover, .choice:focus-visible { border-color: #83b8ff; outline: none; }
+        .choice[aria-pressed="true"] { border-color: #72afff; background: #244c79; color: #fff; box-shadow: inset 0 0 0 1px #72afff; }
+        .foot { margin: 11px 1px 0; color: #9299a5; font-size: 11px; line-height: 1.4; }
+        @media (max-height: 520px) { :host { bottom: 78px; } }
+        @media (prefers-reduced-motion: no-preference) { .panel { animation: appear .12s ease-out; } @keyframes appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } } }
+      `;
+      const launcher = doc.createElement('button');
+      launcher.type = 'button'; launcher.className = 'launcher'; launcher.setAttribute('aria-expanded', 'false');
+      launcher.setAttribute('aria-haspopup', 'dialog');
+      const panel = doc.createElement('section');
+      panel.className = 'panel'; panel.id = 'chatgpt56-effort-panel'; panel.setAttribute('role', 'dialog');
+      panel.setAttribute('aria-label', 'GPT-5.6 思考强度设置'); panel.hidden = true;
+      const heading = doc.createElement('div'); heading.className = 'heading';
+      const title = doc.createElement('span'); title.textContent = '选择思考强度';
+      const close = doc.createElement('button'); close.type = 'button'; close.className = 'close';
+      close.setAttribute('aria-label', '关闭档位设置'); close.textContent = '×';
+      heading.append(title, close);
+      const hint = doc.createElement('p'); hint.className = 'hint';
+      hint.textContent = '此档位按聊天保存；没有记录的新聊天默认使用“中”。';
+      const choicesBox = doc.createElement('div'); choicesBox.className = 'choices';
+      choicesBox.setAttribute('role', 'group'); choicesBox.setAttribute('aria-label', '可选强度');
+      const choiceButtons = LEVELS.map(item => {
+        const button = doc.createElement('button');
+        button.type = 'button'; button.className = 'choice'; button.dataset.level = String(item.value);
+        button.textContent = item.label; button.title = '设为' + item.label;
+        button.setAttribute('aria-pressed', 'false');
+        button.addEventListener('click', () => {
+          route();
+          try {
+            prefs.save(key, item.value);
+            verified = ''; blocked = ''; manualArmed = false; manualUntil = 0; manualToken++;
+            refreshPanel(); setPanelOpen(false, true);
+            status(picker(), '已选择' + item.label + '，正在应用');
+            schedule(1600);
+          } catch (error) {
+            console.warn('[ChatGPT 5.6]', error.message);
+          }
+        });
+        choicesBox.append(button);
+        return button;
+      });
+      const foot = doc.createElement('div'); foot.className = 'foot';
+      foot.textContent = '也可以直接使用 ChatGPT 原生滑杆调整。';
+      panel.append(heading, hint, choicesBox, foot);
+      shadow.append(style, launcher, panel);
+      panelUi = { host, shadow, launcher, panel, close, choices: choiceButtons };
+      function setPanelOpen(open, returnFocus = false) {
+        panel.hidden = !open;
+        launcher.setAttribute('aria-expanded', String(open));
+        if (open) refreshPanel();
+        else if (returnFocus) launcher.focus({ preventScroll: true });
+      }
+      launcher.setAttribute('aria-controls', panel.id);
+      launcher.addEventListener('click', () => setPanelOpen(panel.hidden));
+      close.addEventListener('click', () => setPanelOpen(false, true));
+      shadow.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && !panel.hidden) { event.preventDefault(); setPanelOpen(false, true); }
+      });
+      doc.body.append(host);
+      refreshPanel();
+    }
     const editable = e => !!e && !!e.closest('textarea,input:not([type="range"]),[contenteditable="true"]');
     const strengthControl = e => e && e.closest('[role="slider"],[role="menuitem"][aria-label="强度"],[role="menuitem"][aria-label="Effort"]');
     function captureManual() {
@@ -101,11 +202,11 @@
       const level = Number(s.getAttribute('aria-valuenow'));
       if (s.getAttribute('aria-valuemin') !== '0' || s.getAttribute('aria-valuemax') !== '4' || !valid(level)) return;
       if (level === manualBaseline) return;
-      try { prefs.save(key, level); manualBaseline = level; verified = ''; } catch (error) { console.warn('[ChatGPT 5.6]', error.message); }
+      try { prefs.save(key, level); manualBaseline = level; verified = ''; refreshPanel(); } catch (error) { console.warn('[ChatGPT 5.6]', error.message); }
     }
     function resetNewChat() {
       prefs.resetDraft(context(win.location.pathname.split('/c/')[0] || '/'));
-      prefs.resetDraft('draft:/'); verified = ''; pendingSend = null;
+      prefs.resetDraft('draft:/'); verified = ''; pendingSend = null; refreshPanel();
     }
     function interaction(event) {
       if (!event.isTrusted) return;
@@ -163,10 +264,12 @@
       if (next !== key) {
         if (shouldMigrate(key, next, pendingSend, Date.now())) prefs.migrate(key, next);
         pendingSend = null; key = next; verified = ''; blocked = ''; manualUntil = 0; manualArmed = false;
+        refreshPanel();
       }
     }
     function busy() {
-      return doc.readyState !== 'complete' || Date.now() - born < 4000 || doc.hidden || pointerDown || composing || Date.now() - lastInput < 1400 ||
+      return doc.readyState !== 'complete' || doc.hidden || pointerDown || composing ||
+        (!!panelUi && !panelUi.panel.hidden) || Date.now() - lastInput < 1400 ||
         !!doc.querySelector('button[data-testid="stop-button"],button[aria-label="Stop streaming"],button[aria-label="Stop generating"],button[aria-label="停止生成"],button[aria-label="停止流式传输"]');
     }
     const delay = ms => new Promise(resolve => win.setTimeout(resolve, ms));
@@ -288,6 +391,7 @@
       timer = win.setTimeout(() => reconcile().catch(error => console.warn('[ChatGPT 5.6]', error.message)), ms);
     }
     new win.MutationObserver(records => {
+      if (panelUi && !panelUi.host.isConnected) mountPanel();
       for (const r of records) {
         if (r.type === 'attributes' && r.attributeName === 'aria-valuenow') captureManual();
       }
@@ -296,12 +400,13 @@
       childList: true, subtree: true, characterData: true, attributes: true,
       attributeFilter: ['aria-valuenow', 'aria-checked', 'aria-expanded', 'disabled']
     });
-    win.addEventListener('storage', event => { if (event.key?.startsWith(PREFIX)) schedule(); });
+    win.addEventListener('storage', event => { if (event.key?.startsWith(PREFIX)) { refreshPanel(); schedule(); } });
     win.addEventListener('popstate', () => { pendingSend = null; schedule(); });
     win.addEventListener('blur', () => { pointerDown = false; });
     doc.addEventListener('visibilitychange', () => schedule());
     win.setInterval(() => { route(); schedule(100); }, 1800);
     schedule(1200);
+    mountPanel();
   }
   return { Preferences, context, effort, is56, shouldMigrate, interrupted, start };
 });
