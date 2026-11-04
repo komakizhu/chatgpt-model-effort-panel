@@ -492,6 +492,8 @@
         check();
         const expectedItem = current.state === 'range' ? current.value - current.min + 1 : null;
         const itemMatches = current.itemIndex === null || current.itemIndex === expectedItem;
+        const accessibleChanged = current.accessibleLabel && current.accessibleLabel !== previousLabel;
+        if (accessibleChanged) return current.accessibleLabel;
         if (current.label && itemMatches && ((!previousStatus && !previousLabel) || current.statusText !== previousStatus || current.label !== previousLabel)) {
           return current.label;
         }
@@ -533,9 +535,11 @@
       }
       const captions = Object.create(null);
       let originalValue = initial.value;
-      captions[initial.value] = initial.label || '';
+      const initialItem = initial.value - initial.min + 1;
+      const initialLabel = (initial.accessibleLabel || initial.itemIndex === null || initial.itemIndex === initialItem) ? initial.label : '';
+      captions[initial.value] = initialLabel || '';
       let previousStatus = initial.statusText;
-      let previousLabel = initial.label || '';
+      let previousLabel = initialLabel || '';
       let interrupted = false;
       let probeFailed = false;
       try {
