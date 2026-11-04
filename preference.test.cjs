@@ -19,6 +19,7 @@ const {
   normalizePanelSettings,
   readPanelSettings,
   clampPanelPosition,
+  preferredPanelPosition,
   panelSummary,
   resolveConversationPreference,
   resolveEffortLabel
@@ -58,6 +59,18 @@ test('面板位置按视口和展开后的高度限制，原始偏好不变', ()
   assert.deepEqual(clampPanelPosition(desired, { width: 400, height: 300 }, { width: 290, height: 200 }), { right: 110, bottom: 100 });
   assert.deepEqual(desired, { right: 400, bottom: 500 });
   assert.deepEqual(clampPanelPosition({ right: -4, bottom: -8 }, { width: 200, height: 100 }, { width: 290, height: 200 }), { right: 0, bottom: 0 });
+});
+
+test('面板默认停靠在输入框上方并避开右侧录音按钮', () => {
+  const position = preferredPanelPosition(
+    { width: 1024, height: 768 },
+    { width: 198, height: 36 },
+    { top: 680 },
+    { left: 880, top: 700 }
+  );
+  assert.deepEqual(position, { right: 156, bottom: 100 });
+  assert.ok(1024 - position.right - 198 <= 880 - 12);
+  assert.ok(768 - position.bottom <= 680 - 12);
 });
 
 test('折叠摘要只显示网页已核对的模型与强度', () => {

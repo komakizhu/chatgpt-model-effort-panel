@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 模型与档位
 // @namespace    local.chatgpt-preference
-// @version      0.5.0
+// @version      0.5.1
 // @description  通过原生控件选择模型与该模型支持的档位，并按聊天保存偏好。
 // @match        https://chatgpt.com/*
 // @run-at       document-end
@@ -17,7 +17,7 @@
 })(typeof window === 'undefined' ? null : window, function () {
   'use strict';
 
-  const VERSION = '0.5.0';
+  const VERSION = '0.5.1';
   const PANEL_KEY = 'chatgpt-model-panel-v1';
   const PREFIX = 'chatgpt-model-preference-v2:';
   const LEGACY_PREFIX = 'chatgpt-56-preference-v1:';
@@ -65,6 +65,21 @@
       right: Math.max(0, Math.min(desired.right, Math.max(0, viewport.width - panel.width))),
       bottom: Math.max(0, Math.min(desired.bottom, Math.max(0, viewport.height - panel.height)))
     };
+  }
+
+  function preferredPanelPosition(viewport, panel, editorRect, voiceRect, gap = 12) {
+    let right = gap;
+    let bottom = gap;
+    if (editorRect && editorRect.top > 0 && editorRect.top < viewport.height) {
+      bottom = Math.max(bottom, viewport.height - editorRect.top + gap);
+    }
+    if (voiceRect) {
+      if (voiceRect.left - gap >= panel.width) right = viewport.width - voiceRect.left + gap;
+      if (voiceRect.top > 0 && voiceRect.top < viewport.height) {
+        bottom = Math.max(bottom, viewport.height - voiceRect.top + gap);
+      }
+    }
+    return clampPanelPosition({ right, bottom }, viewport, panel);
   }
 
   function panelSummary(wanted, current) {
@@ -284,6 +299,7 @@
     const panelStorage = readPanelSettings(win.localStorage);
     let panelSettings = panelStorage.settings, panelStorageAvailable = panelStorage.available;
     let drag = null, positionFrame = 0;
+    let positionAnchorObserver = null, positionAnchors = new Set();
     let key = context(win.location.pathname), timer = 0, captureTimer = 0;
     let serial = 0, lastInput = 0, pointerDown = false, composing = false;
     let working = false, ownedMenu = false, userOwnsMenu = false;
@@ -298,7 +314,15 @@
     const picker = () => [...doc.querySelectorAll(PICKER)].find(visible);
     const menus = () => [...doc.querySelectorAll('[role="menu"]')].filter(visible);
     const slider = () => menus().map(menu => menu.querySelector('[role="slider"]')).find(visible) || null;
-    const stopButton = () => doc.querySelector('button[data-testid="stop-button"],button[aria-label="Stop streaming"],button[aria-label="Stop generating"],button[aria-label="停止生成"],button[aria-label="停止流式传输"]');
+    const stopButton = () => [...doc.querySelectorAll('button[data-testid="stop-button"],button[aria-label="Stop streaming"],button[aria-label="Stop generating"],button[aria-label="停止生成"],button[aria-label="停止流式传输"]')].find(visible);
+    const voiceButton = () => {
+      const buttons = [...doc.querySelectorAll('button')].filter(visible);
+      const matches = buttons.filter(element => /^(?:听写|Dictate|开始语音|Start voice|录音|Record)$/i.test(
+        normalize(element.getAttribute('aria-label') || element.textContent)
+      ));
+      return matches.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0] || null;
+    };
+    const composer = () => [...doc.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);
     const delay = ms => new Promise(resolve => win.setTimeout(resolve, ms));
     const currentPath = () => win.location.pathname;
     const selectedIn = options => options.find(option => option.checked) || null;
@@ -790,10 +814,35 @@
     function applyPanelPosition() {
       if (!panelUi || !panelUi.host.isConnected) return;
       const rect = panelUi.host.getBoundingClientRect();
-      const actual = clampPanelPosition(drag?.position || panelSettings.position,
-        { width: win.innerWidth, height: win.innerHeight }, { width: rect.width, height: rect.height });
+      const viewport = { width: win.innerWidth, height: win.innerHeight };
+      const panel = { width: rect.width, height: rect.height };
+      refreshPositionAnchors();
+      let requested = drag?.position || panelSettings.position;
+      if (!requested) {
+        const editor = composer();
+        const voice = voiceButton();
+        requested = preferredPanelPosition(
+          viewport,
+          panel,
+          editor?.getBoundingClientRect(),
+          voice?.getBoundingClientRect()
+        );
+      }
+      const actual = clampPanelPosition(requested, viewport, panel);
       panelUi.host.style.right = actual.right + 'px';
       panelUi.host.style.bottom = actual.bottom + 'px';
+    }
+
+    function refreshPositionAnchors() {
+      if (!positionAnchorObserver) return;
+      const next = panelSettings.position ? new Set() : new Set([composer(), voiceButton()].filter(Boolean));
+      for (const anchor of positionAnchors) {
+        if (!next.has(anchor)) positionAnchorObserver.unobserve(anchor);
+      }
+      for (const anchor of next) {
+        if (!positionAnchors.has(anchor)) positionAnchorObserver.observe(anchor);
+      }
+      positionAnchors = next;
     }
 
     function queuePanelPosition() {
@@ -890,6 +939,11 @@
         if (event.key === 'Escape' && drag) { event.preventDefault(); finishDrag(true); }
       }, true);
       if (win.ResizeObserver) new win.ResizeObserver(queuePanelPosition).observe(panel);
+      if (win.ResizeObserver) {
+        positionAnchorObserver = new win.ResizeObserver(() => {
+          if (!panelSettings.position) queuePanelPosition();
+        });
+      }
       applyPanelPosition();
     }
 
@@ -907,7 +961,7 @@
       const shadow = host.attachShadow({ mode: 'open' });
       const style = doc.createElement('style');
       style.textContent = `
-        :host { all: initial; position: fixed; right: 10px; bottom: 10px; z-index: 2147483647; display: block; width: min(224px, calc(100vw - 16px)); color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        :host { all: initial; position: fixed; right: 12px; bottom: 112px; z-index: 2147483647; display: block; width: min(198px, calc(100vw - 16px)); color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         * { box-sizing: border-box; }
         .panel { width: 100%; border: 1px solid rgba(255,255,255,.14); border-radius: 13px; background: rgba(25,28,34,.96); color: #f4f5f7; box-shadow: 0 8px 26px rgba(0,0,0,.28); backdrop-filter: blur(16px); cursor: grab; touch-action: manipulation; }
         .panel.is-dragging { cursor: grabbing; user-select: none; touch-action: none; }
@@ -918,7 +972,7 @@
         .body { max-height: calc(100vh - 65px); overflow-y: auto; padding: 7px 8px 8px; border-top: 1px solid rgba(255,255,255,.08); }
         .body[hidden] { display: none; }
         .model-list { display: grid; gap: 6px; }
-        .model-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(88px, .9fr); gap: 5px; align-items: center; min-width: 0; padding: 4px; border: 1px solid rgba(255,255,255,.10); border-radius: 10px; background: rgba(39,43,51,.76); transition: border-color 160ms ease, background 160ms ease; }
+        .model-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(78px, .9fr); gap: 5px; align-items: center; min-width: 0; padding: 4px; border: 1px solid rgba(255,255,255,.10); border-radius: 10px; background: rgba(39,43,51,.76); transition: border-color 160ms ease, background 160ms ease; }
         .model-row[data-selected="true"] { border-color: rgba(130,184,255,.72); background: rgba(53,72,98,.62); }
         .model-choice, .effort-choice, .tool { min-height: 32px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #f4f5f7; font: inherit; font-size: 12px; }
         .model-choice { min-width: 0; overflow: hidden; padding: 0 7px; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; cursor: pointer; }
@@ -1195,7 +1249,7 @@
           return;
         }
         blocked = targetSignature(desired, normalize(picker()?.textContent || ''));
-        confirmedPreference = null;
+        // 保留最后一次已核对的页面内容，避免一次读取失败让折叠态退化成省略号。
         status('暂停：' + error.message);
         console.warn('[ChatGPT model preference]', error.message);
       } finally {
@@ -1243,6 +1297,7 @@
     win.setInterval(() => {
       const previousKey = key;
       route();
+      if (!panelSettings.position) queuePanelPosition();
       const currentButton = normalize(picker()?.textContent || '');
       if (previousKey !== key || (lastObservedButton && currentButton !== lastObservedButton)) {
         verified = ''; blocked = '';
@@ -1278,6 +1333,7 @@
     normalizePanelSettings,
     readPanelSettings,
     clampPanelPosition,
+    preferredPanelPosition,
     panelSummary,
     resolveConversationPreference,
     resolveEffortLabel,
