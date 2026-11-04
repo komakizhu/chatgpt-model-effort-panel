@@ -102,6 +102,12 @@
     return match ? normalize(match[1]) : null;
   }
 
+  function effortItemIndexFromStatus(value) {
+    const text = normalize(value);
+    const match = text.match(/(?:第\s*)?(\d+)\s*项|item\s+(\d+)/i);
+    return match ? Number(match[1] || match[2]) : null;
+  }
+
   function effortKey(label) {
     const text = normalizedKey(label);
     if (!text) return null;
@@ -444,7 +450,7 @@
     function readEffortStatus(menu) {
       const statusNode = menu && menu.querySelector('[role="status"][aria-live], [role="status"]');
       const raw = normalize(statusNode && statusNode.textContent);
-      return { raw, label: effortLabelFromStatus(raw) };
+      return { raw, label: effortLabelFromStatus(raw), itemIndex: effortItemIndexFromStatus(raw) };
     }
 
     function readEffortCaption(menu) {
@@ -458,7 +464,7 @@
 
     function currentEffort() {
       const control = slider();
-      if (!control) return { state: 'missing', control: null, value: null, label: null, min: null, max: null };
+      if (!control) return { state: 'missing', control: null, value: null, label: null, statusText: '', itemIndex: null, min: null, max: null };
       const menu = control.closest('[role="menu"]');
       const min = Number(control.getAttribute('aria-valuemin'));
       const max = Number(control.getAttribute('aria-valuemax'));
@@ -472,7 +478,9 @@
         menu,
         value,
         label: accessibleLabel || status.label,
-        statusText: [status.raw, accessibleLabel].filter(Boolean).join(' | '),
+        statusText: accessibleLabel ? 'aria:' + accessibleLabel : status.raw,
+        itemIndex: status.itemIndex,
+        accessibleLabel,
         min,
         max
       };
@@ -482,7 +490,9 @@
       let current = state;
       for (let i = 0; i < 12; i++) {
         check();
-        if (current.label && ((!previousStatus && !previousLabel) || current.statusText !== previousStatus || current.label !== previousLabel)) {
+        const expectedItem = current.state === 'range' ? current.value - current.min + 1 : null;
+        const itemMatches = current.itemIndex === null || current.itemIndex === expectedItem;
+        if (current.label && itemMatches && ((!previousStatus && !previousLabel) || current.statusText !== previousStatus || current.label !== previousLabel)) {
           return current.label;
         }
         await delay(45);
@@ -1217,7 +1227,7 @@
       attributeFilter: ['aria-valuenow', 'aria-checked', 'aria-expanded', 'aria-disabled', 'disabled']
     });
     win.addEventListener('storage', event => {
-      if (event.key?.startsWith(PREFIX)) {
+      if (event.key === PREFIX + key) {
         conversationPreference = null;
         verified = ''; blocked = ''; renderPanel(); schedule();
       }
@@ -1251,6 +1261,7 @@
     context,
     normalize,
     effortLabelFromStatus,
+    effortItemIndexFromStatus,
     effortKey,
     effortValueKey,
     findEffortOption,

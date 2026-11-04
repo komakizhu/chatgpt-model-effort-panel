@@ -5,6 +5,7 @@ const {
   context,
   DEFAULT_PREFERENCE,
   effortLabelFromStatus,
+  effortItemIndexFromStatus,
   effortKey,
   effortValueKey,
   findEffortOption,
@@ -157,6 +158,8 @@ test('模型切换时已保存的聊天档位不会被临时草稿覆盖', () =>
 test('中英文原生强度状态解析成可读标签', () => {
   assert.equal(effortLabelFromStatus('Medium，第 2 项，共 5 项。'), 'Medium');
   assert.equal(effortLabelFromStatus('Extra High, item 4 of 5.'), 'Extra High');
+  assert.equal(effortItemIndexFromStatus('Medium，第 2 项，共 5 项。'), 2);
+  assert.equal(effortItemIndexFromStatus('Extra High, item 4 of 5.'), 4);
   assert.equal(effortLabelFromStatus('无项目序号的文字'), null);
   assert.equal(effortKey('Medium'), 'effort:medium');
   assert.equal(effortKey('极高'), 'effort:extra-high');
