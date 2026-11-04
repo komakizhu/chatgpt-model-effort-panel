@@ -464,28 +464,31 @@
       const max = Number(control.getAttribute('aria-valuemax'));
       const value = Number(control.getAttribute('aria-valuenow'));
       const status = readEffortStatus(menu);
+      const valueText = normalize(control.getAttribute('aria-valuetext'));
+      const accessibleLabel = /[A-Za-z\u4e00-\u9fff]/.test(valueText) ? valueText : '';
       return {
         state: validIndexRange(min, max) && Number.isInteger(value) && value >= min && value <= max ? 'range' : 'unknown',
         control,
         menu,
         value,
-        label: status.label,
-        statusText: status.raw,
+        label: accessibleLabel || status.label,
+        statusText: [status.raw, accessibleLabel].filter(Boolean).join(' | '),
         min,
         max
       };
     }
 
-    async function waitForEffortCaption(state, previousStatus, fallback, check) {
+    async function waitForEffortCaption(state, previousStatus, previousLabel, fallback, check) {
       let current = state;
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 12; i++) {
         check();
-        const status = readEffortStatus(current.menu);
-        if (status.label && (!previousStatus || status.raw !== previousStatus)) return status.label;
+        if (current.label && ((!previousStatus && !previousLabel) || current.statusText !== previousStatus || current.label !== previousLabel)) {
+          return current.label;
+        }
         await delay(45);
         current = currentEffort();
       }
-      return current.label || fallback || '';
+      return fallback || '';
     }
 
     async function moveSliderTo(target, check) {
@@ -522,6 +525,7 @@
       let originalValue = initial.value;
       captions[initial.value] = initial.label || '';
       let previousStatus = initial.statusText;
+      let previousLabel = initial.label || '';
       let interrupted = false;
       let probeFailed = false;
       try {
@@ -529,14 +533,18 @@
         while (current > initial.min) {
           const next = await moveSliderTo(current - 1, check);
           current = next.value;
-          captions[current] = await waitForEffortCaption(next, previousStatus, next.label, check);
-          previousStatus = currentEffort().statusText || previousStatus;
+          captions[current] = await waitForEffortCaption(next, previousStatus, previousLabel, '', check);
+          const observed = currentEffort();
+          previousStatus = observed.statusText || previousStatus;
+          previousLabel = observed.label || previousLabel;
         }
         while (current < initial.max) {
           const next = await moveSliderTo(current + 1, check);
           current = next.value;
-          captions[current] = await waitForEffortCaption(next, previousStatus, next.label, check);
-          previousStatus = currentEffort().statusText || previousStatus;
+          captions[current] = await waitForEffortCaption(next, previousStatus, previousLabel, '', check);
+          const observed = currentEffort();
+          previousStatus = observed.statusText || previousStatus;
+          previousLabel = observed.label || previousLabel;
         }
       } catch (error) {
         try { check(); } catch (_) { interrupted = true; }
@@ -1124,12 +1132,21 @@
           if (desired.effortState === 'unknown' && requestedChoice && requestedChoice.effortState === 'unknown') chosen = effortState.current;
           if (!chosen) throw new Error('目标档位不在该模型当前提供的原生选项中');
           let verifiedEffort = effortState.current;
+          let observedLabel = chosen.label;
           if (!effortState.current || effortState.current.key !== chosen.key) {
+            const beforeEffort = currentEffort();
             verifiedEffort = await moveSliderTo(chosen.value, check);
+            observedLabel = await waitForEffortCaption(
+              verifiedEffort,
+              beforeEffort.statusText,
+              beforeEffort.label || '',
+              chosen.label,
+              check
+            );
           }
           verifiedEffort = currentEffort();
           if (verifiedEffort.state !== 'range' || verifiedEffort.value !== chosen.value) throw new Error('强度档位没有通过原生滑杆值确认');
-          const actualLabel = resolveEffortLabel(chosen.label, readEffortCaption(verifiedEffort.menu));
+          const actualLabel = resolveEffortLabel(chosen.label, observedLabel);
           const resolvedOptions = effortState.options.map(option =>
             option.value === chosen.value && actualLabel ? { ...option, label: actualLabel } : option
           );
