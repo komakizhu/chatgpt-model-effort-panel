@@ -13,7 +13,12 @@ const {
   isManualNativeAction,
   findModel,
   normalizePreference,
-  isLimitHint
+  isLimitHint,
+  PANEL_KEY,
+  normalizePanelSettings,
+  readPanelSettings,
+  clampPanelPosition,
+  panelSummary
 } = require('./ChatGPT_56_Preference.user.js');
 
 function memory() {
@@ -27,6 +32,38 @@ function memory() {
 }
 
 const noop = () => {};
+
+test('面板首次默认折叠，单独保存位置并读取', () => {
+  const store = memory();
+  assert.deepEqual(readPanelSettings(store), { settings: { collapsed: true, position: null }, available: true });
+  store.setItem(PANEL_KEY, JSON.stringify({ collapsed: false, position: { right: 45, bottom: 80 } }));
+  assert.deepEqual(readPanelSettings(store).settings, { collapsed: false, position: { right: 45, bottom: 80 } });
+});
+
+test('无效面板数据回退默认，存储不可用有独立状态', () => {
+  const store = memory();
+  store.setItem(PANEL_KEY, '{broken');
+  assert.deepEqual(readPanelSettings(store), { settings: { collapsed: true, position: null }, available: true });
+  assert.deepEqual(normalizePanelSettings({ collapsed: false, position: { right: -1, bottom: 2 } }),
+    { collapsed: true, position: null });
+  assert.equal(readPanelSettings({ getItem() { throw new Error('blocked'); } }).available, false);
+});
+
+test('面板位置按视口和展开后的高度限制，原始偏好不变', () => {
+  const desired = { right: 400, bottom: 500 };
+  assert.deepEqual(clampPanelPosition(null, { width: 800, height: 600 }, { width: 290, height: 40 }), { right: 12, bottom: 12 });
+  assert.deepEqual(clampPanelPosition(desired, { width: 400, height: 300 }, { width: 290, height: 200 }), { right: 110, bottom: 100 });
+  assert.deepEqual(desired, { right: 400, bottom: 500 });
+  assert.deepEqual(clampPanelPosition({ right: -4, bottom: -8 }, { width: 200, height: 100 }, { width: 290, height: 200 }), { right: 0, bottom: 0 });
+});
+
+test('摘要区分目标、网页确认与不可用', () => {
+  const wanted = DEFAULT_PREFERENCE;
+  assert.deepEqual(panelSummary(wanted, wanted, '已确认', true), { text: 'GPT-5.6 Sol · Medium', state: '已确认' });
+  assert.deepEqual(panelSummary(wanted, wanted, '等待空闲', false), { text: '目标：GPT-5.6 Sol · Medium', state: '等待' });
+  assert.equal(panelSummary(wanted, null, '不可用：限额', false).state, '不可用');
+  assert.equal(panelSummary(wanted, null, '暂停：无法识别', false).state, '未确认');
+});
 
 test('初始默认组合为 GPT-5.6 Sol + Medium', () => {
   const prefs = new Preferences(memory(), memory());
