@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 模型与档位
 // @namespace    local.chatgpt-preference
-// @version      0.4.0
+// @version      0.5.0
 // @description  通过原生控件选择模型与该模型支持的档位，并按聊天保存偏好。
 // @match        https://chatgpt.com/*
 // @run-at       document-end
@@ -17,7 +17,7 @@
 })(typeof window === 'undefined' ? null : window, function () {
   'use strict';
 
-  const VERSION = '0.4.0';
+  const VERSION = '0.5.0';
   const PANEL_KEY = 'chatgpt-model-panel-v1';
   const PREFIX = 'chatgpt-model-preference-v2:';
   const LEGACY_PREFIX = 'chatgpt-56-preference-v1:';
@@ -37,6 +37,7 @@
   const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
   const normalizedKey = value => normalize(value).toLocaleLowerCase();
   const validIndexRange = (min, max) => Number.isInteger(min) && Number.isInteger(max) && min >= 0 && max >= min && max - min <= 9;
+  const panelModelLabel = value => /^GPT-5\.6\s+Sol$/i.test(normalize(value)) ? 'GPT-5.6' : normalize(value);
 
   function normalizePanelSettings(value) {
     const defaults = { collapsed: true, position: null };
@@ -66,18 +67,28 @@
     };
   }
 
-  function panelSummary(wanted, current, statusText, verified) {
+  function panelSummary(wanted, current) {
     const describe = preference => {
       if (!preference) return '未设置';
-      if (preference.effortState === 'none') return preference.modelLabel + ' · 无强度';
-      if (preference.effortState === 'unknown') return preference.modelLabel + ' · 档位未识别';
-      return preference.modelLabel + ' · ' + preference.effortLabel;
+      const modelLabel = panelModelLabel(preference.modelLabel);
+      if (preference.effortState === 'none') return modelLabel + ' · 无强度';
+      if (preference.effortState === 'unknown') return modelLabel + ' · 档位未识别';
+      return modelLabel + ' · ' + preference.effortLabel;
     };
-    if (verified && current) return { text: describe(current), state: '已确认' };
-    const state = /不可用/.test(statusText) ? '不可用' :
-      /暂停|失败|无法识别/.test(statusText) ? '未确认' :
-      /正在/.test(statusText) ? '应用中' : '等待';
-    return { text: '目标：' + describe(wanted), state };
+    // 折叠态只显示网页当前已核对的组合，不把目标偏好或等待状态冒充成页面事实。
+    return { text: current ? describe(current) : '', state: '' };
+  }
+
+  function resolveConversationPreference(saved, pending, conversation) {
+    return pending || conversation || saved;
+  }
+
+  function resolveEffortLabel(chosenLabel, observedLabel) {
+    const chosen = normalize(chosenLabel);
+    const observed = normalize(observedLabel);
+    if (!observed) return chosen;
+    if (/^原生第\s*\d+\s*档$/i.test(chosen)) return observed;
+    return effortKey(chosen) === effortKey(observed) ? observed : chosen;
   }
 
   function context(path) {
@@ -271,6 +282,7 @@
     let serial = 0, lastInput = 0, pointerDown = false, composing = false;
     let working = false, ownedMenu = false, userOwnsMenu = false;
     let pendingChoice = null, pendingNativeCapture = false;
+    let conversationPreference = null;
     let verified = '', blocked = '', lastObservedButton = '', statusText = '正在读取原生模型选项';
     let catalog = [], effortOptions = [], effortModelKey = '', confirmedPreference = null;
     let panelUi = null, pendingSend = null;
@@ -429,9 +441,14 @@
       return { items, elements, selected: selectedIn(items) };
     }
 
-    function readEffortCaption(menu) {
+    function readEffortStatus(menu) {
       const statusNode = menu && menu.querySelector('[role="status"][aria-live], [role="status"]');
-      return effortLabelFromStatus(statusNode && statusNode.textContent);
+      const raw = normalize(statusNode && statusNode.textContent);
+      return { raw, label: effortLabelFromStatus(raw) };
+    }
+
+    function readEffortCaption(menu) {
+      return readEffortStatus(menu).label;
     }
 
     function noEffortIsExplicit(menu) {
@@ -446,15 +463,29 @@
       const min = Number(control.getAttribute('aria-valuemin'));
       const max = Number(control.getAttribute('aria-valuemax'));
       const value = Number(control.getAttribute('aria-valuenow'));
+      const status = readEffortStatus(menu);
       return {
         state: validIndexRange(min, max) && Number.isInteger(value) && value >= min && value <= max ? 'range' : 'unknown',
         control,
         menu,
         value,
-        label: readEffortCaption(menu),
+        label: status.label,
+        statusText: status.raw,
         min,
         max
       };
+    }
+
+    async function waitForEffortCaption(state, previousStatus, fallback, check) {
+      let current = state;
+      for (let i = 0; i < 8; i++) {
+        check();
+        const status = readEffortStatus(current.menu);
+        if (status.label && (!previousStatus || status.raw !== previousStatus)) return status.label;
+        await delay(45);
+        current = currentEffort();
+      }
+      return current.label || fallback || '';
     }
 
     async function moveSliderTo(target, check) {
@@ -489,7 +520,8 @@
       }
       const captions = Object.create(null);
       let originalValue = initial.value;
-      captions[initial.value] = readEffortCaption(initial.menu) || '';
+      captions[initial.value] = initial.label || '';
+      let previousStatus = initial.statusText;
       let interrupted = false;
       let probeFailed = false;
       try {
@@ -497,12 +529,14 @@
         while (current > initial.min) {
           const next = await moveSliderTo(current - 1, check);
           current = next.value;
-          captions[current] = next.label || '';
+          captions[current] = await waitForEffortCaption(next, previousStatus, next.label, check);
+          previousStatus = currentEffort().statusText || previousStatus;
         }
         while (current < initial.max) {
           const next = await moveSliderTo(current + 1, check);
           current = next.value;
-          captions[current] = next.label || '';
+          captions[current] = await waitForEffortCaption(next, previousStatus, next.label, check);
+          previousStatus = currentEffort().statusText || previousStatus;
         }
       } catch (error) {
         try { check(); } catch (_) { interrupted = true; }
@@ -583,81 +617,144 @@
       return [key, preference.modelKey, preference.effortKey || preference.effortState, normalize(buttonText)].join('|');
     }
 
-    function renderPanel() {
-      if (!panelUi) return;
-      const saved = prefs.ensure(key);
-      const defaultPreference = prefs.readDefault();
-      const wanted = pendingChoice || saved;
-      const resolved = findModel(catalog, wanted);
-      const selectValue = resolved ? resolved.key : wanted.modelKey;
-      const existingValues = new Set([...panelUi.model.options].map(option => option.value));
-      if (catalog.length && (!panelUi.catalogKey || panelUi.catalogKey !== catalog.map(item =>
-        [item.key, item.label, item.category, item.disabled, item.reason].join(':')
-      ).join('|'))) {
-        panelUi.model.replaceChildren();
-        const models = catalog.map(item => ({ ...item }));
-        if (!models.some(item => item.key === wanted.modelKey || normalizedKey(item.label) === normalizedKey(wanted.modelLabel))) {
-          models.unshift(createModelOption({ label: wanted.modelLabel, key: wanted.modelKey, disabled: true, reason: '当前原生菜单没有此模型' }));
-        }
-        let currentGroup = null;
-        let groupOptions = null;
-        for (const item of models) {
-          if (item.category !== currentGroup) {
-            currentGroup = item.category;
-            groupOptions = null;
-            if (currentGroup) {
-              groupOptions = doc.createElement('optgroup');
-              groupOptions.label = currentGroup;
-              panelUi.model.append(groupOptions);
-            }
-          }
-          const option = doc.createElement('option');
-          option.value = item.key;
-          option.textContent = item.label + (item.disabled ? '（不可用：' + (item.reason || '原生限制') + '）' : '');
-          option.disabled = item.disabled;
-          (groupOptions || panelUi.model).append(option);
-        }
-        panelUi.catalogKey = catalog.map(item =>
-          [item.key, item.label, item.category, item.disabled, item.reason].join(':')
-        ).join('|');
-      }
-      if (selectValue && (existingValues.has(selectValue) || [...panelUi.model.options].some(option => option.value === selectValue))) panelUi.model.value = selectValue;
-      panelUi.effort.replaceChildren();
-      if (wanted.effortState === 'none') {
-        const option = doc.createElement('option'); option.textContent = '此模型没有强度设置'; option.value = ''; option.disabled = true; option.selected = true;
-        panelUi.effort.append(option); panelUi.effort.disabled = true;
-      } else if (wanted.effortState === 'unknown' || effortModelKey !== (resolved ? resolved.key : wanted.modelKey) || !effortOptions.length) {
-        const option = doc.createElement('option'); option.textContent = '等待读取原生档位'; option.value = ''; option.disabled = true; option.selected = true;
-        panelUi.effort.append(option); panelUi.effort.disabled = true;
-      } else {
-        for (const item of effortOptions) {
-          const option = doc.createElement('option'); option.value = item.key; option.textContent = item.label;
-          panelUi.effort.append(option);
-        }
-        panelUi.effort.disabled = false;
-        if (wanted.effortKey && effortOptions.some(item => item.key === wanted.effortKey)) panelUi.effort.value = wanted.effortKey;
-      }
-      const current = confirmedPreference;
-      panelUi.current.textContent = current ? '网页：' + describePreference(current) : '网页：未确认';
-      panelUi.defaultValue.textContent = '默认：' + describePreference(defaultPreference);
-      panelUi.status.textContent = statusText;
-      panelUi.saveDefault.disabled = !current || current.effortState === 'unknown' || !!blocked || statusText !== '已确认';
-      const confirmed = !pendingChoice && !pendingNativeCapture && !blocked && !!current &&
-        verified === targetSignature(wanted, picker()?.textContent || '') &&
-        (statusText === '已确认' || statusText === '已保存为新聊天默认');
-      const short = panelSummary(wanted, current, statusText, confirmed);
-      panelUi.short.textContent = short.text;
-      panelUi.short.title = short.text;
-      panelUi.short.setAttribute('aria-label', short.text);
-      panelUi.shortState.textContent = short.state;
-      panelUi.storageNote.hidden = panelStorageAvailable;
+    function rememberConversationPreference(preference) {
+      const normalized = normalizePreference(preference);
+      if (normalized) conversationPreference = { key, preference: normalized };
     }
 
-    function describePreference(preference) {
-      if (!preference) return '未设置';
-      if (preference.effortState === 'none') return preference.modelLabel + '（无强度设置）';
-      if (preference.effortState === 'unknown') return preference.modelLabel + '（档位未识别）';
-      return preference.modelLabel + ' + ' + preference.effortLabel;
+    function savedConversationPreference() {
+      return conversationPreference && conversationPreference.key === key ? conversationPreference.preference : null;
+    }
+
+    function desiredConversationPreference() {
+      return resolveConversationPreference(prefs.ensure(key), pendingChoice, savedConversationPreference());
+    }
+
+    function appendEffortOption(select, label, value = '', disabled = true) {
+      const option = doc.createElement('option');
+      option.textContent = label;
+      option.value = value;
+      option.disabled = disabled;
+      option.selected = disabled;
+      select.append(option);
+    }
+
+    function chooseModel(item) {
+      if (!item || item.disabled) return;
+      route();
+      pendingChoice = { modelKey: item.key, modelLabel: item.label, effortKey: null, effortLabel: '', effortState: 'unknown' };
+      rememberConversationPreference(pendingChoice);
+      verified = ''; blocked = '';
+      status('等待空闲后应用所选模型');
+      schedule(1500);
+    }
+
+    function chooseEffort(item, value) {
+      const selected = item && !item.disabled ? item : null;
+      const chosenEffort = effortOptions.find(option => option.key === value);
+      if (!selected || !chosenEffort || effortModelKey !== selected.key) {
+        status('当前模型的档位尚未确认');
+        return;
+      }
+      route();
+      pendingChoice = {
+        modelKey: selected.key,
+        modelLabel: selected.label,
+        effortKey: chosenEffort.key,
+        effortLabel: chosenEffort.label,
+        effortState: 'value'
+      };
+      rememberConversationPreference(pendingChoice);
+      verified = ''; blocked = '';
+      status('等待空闲后应用所选档位');
+      schedule(1500);
+    }
+
+    function renderModelRows(wanted, resolved) {
+      const models = catalog.map(item => ({ ...item }));
+      if (!models.some(item => item.key === wanted.modelKey || normalizedKey(item.label) === normalizedKey(wanted.modelLabel))) {
+        models.unshift(createModelOption({ label: wanted.modelLabel, key: wanted.modelKey, disabled: true, reason: '当前原生菜单没有此模型' }));
+      }
+      const selectedKey = resolved ? resolved.key : wanted.modelKey;
+      const catalogKey = models.map(item => [item.key, item.label, item.category, item.disabled, item.reason].join(':')).join('|');
+      if (panelUi.catalogKey !== catalogKey) {
+        panelUi.modelList.replaceChildren();
+        panelUi.modelRows = new Map();
+        for (const item of models) {
+          const row = doc.createElement('div');
+          row.className = 'model-row';
+          row.dataset.modelKey = item.key;
+          const modelButton = doc.createElement('button');
+          modelButton.className = 'model-choice';
+          modelButton.type = 'button';
+          modelButton.textContent = panelModelLabel(item.label);
+          modelButton.title = item.reason || item.label;
+          modelButton.disabled = item.disabled;
+          modelButton.dataset.chatgptPanelControl = '';
+          modelButton.addEventListener('click', event => {
+            if (!event.isTrusted) return;
+            chooseModel(item);
+          });
+          const effort = doc.createElement('select');
+          effort.className = 'effort-choice';
+          effort.setAttribute('aria-label', item.label + ' 强度');
+          effort.dataset.chatgptPanelControl = '';
+          effort.addEventListener('change', event => {
+            if (!event.isTrusted) return;
+            chooseEffort(item, effort.value);
+          });
+          row.append(modelButton, effort);
+          panelUi.modelList.append(row);
+          panelUi.modelRows.set(item.key, { item, row, modelButton, effort });
+        }
+        panelUi.catalogKey = catalogKey;
+      }
+      for (const { item, row, modelButton, effort } of panelUi.modelRows.values()) {
+        const isSelected = item.key === selectedKey;
+        row.dataset.selected = String(isSelected);
+        row.setAttribute('aria-disabled', String(item.disabled));
+        modelButton.setAttribute('aria-pressed', String(isSelected));
+        effort.replaceChildren();
+        const canReadEffort = isSelected && !item.disabled && wanted.effortState !== 'unknown' &&
+          effortModelKey === item.key && effortOptions.length > 0;
+        if (item.disabled) {
+          appendEffortOption(effort, '不可用');
+          effort.disabled = true;
+        } else if (isSelected && wanted.effortState === 'none') {
+          appendEffortOption(effort, '无强度设置');
+          effort.disabled = true;
+        } else if (!canReadEffort) {
+          appendEffortOption(effort, '选择模型后读取强度');
+          effort.disabled = true;
+        } else {
+          for (const option of effortOptions) {
+            const effortOption = doc.createElement('option');
+            effortOption.value = option.key;
+            effortOption.textContent = option.label;
+            effort.append(effortOption);
+          }
+          effort.disabled = false;
+          if (wanted.effortKey && effortOptions.some(option => option.key === wanted.effortKey)) {
+            effort.value = wanted.effortKey;
+          }
+        }
+      }
+    }
+
+    function renderPanel() {
+      if (!panelUi) return;
+      const saved = desiredConversationPreference();
+      const wanted = pendingChoice || saved;
+      const resolved = findModel(catalog, wanted);
+      renderModelRows(wanted, resolved);
+      const current = confirmedPreference;
+      panelUi.status.textContent = statusText;
+      panelUi.saveDefault.disabled = !current || current.effortState === 'unknown' || !!blocked || statusText !== '已确认';
+      const short = panelSummary(wanted, current);
+      panelUi.short.textContent = short.text || '…';
+      panelUi.short.title = short.text;
+      panelUi.short.setAttribute('aria-label', short.text);
+      panelUi.storageNote.hidden = panelStorageAvailable;
     }
 
     function savePanelSettings() {
@@ -691,8 +788,9 @@
         panelSettings.position = previous.position;
         savePanelSettings();
       }
-      if (panelUi.handle.hasPointerCapture?.(previous.pointerId)) {
-        panelUi.handle.releasePointerCapture(previous.pointerId);
+      panelUi.panel.classList.remove('is-dragging');
+      if (panelUi.dragSurface.hasPointerCapture?.(previous.pointerId)) {
+        panelUi.dragSurface.releasePointerCapture(previous.pointerId);
       }
       applyPanelPosition();
       lastInput = Date.now();
@@ -703,7 +801,7 @@
       if (collapsed && panelUi.body.contains(panelUi.shadow.activeElement)) panelUi.toggle.focus({ preventScroll: true });
       panelSettings.collapsed = collapsed;
       panelUi.body.hidden = collapsed;
-      panelUi.toggle.textContent = collapsed ? '展开 ▴' : '折叠 ▾';
+      panelUi.toggle.textContent = collapsed ? '▴' : '▾';
       panelUi.toggle.setAttribute('aria-label', collapsed ? '展开模型与档位面板' : '折叠模型与档位面板');
       panelUi.toggle.setAttribute('aria-expanded', String(!collapsed));
       savePanelSettings();
@@ -711,9 +809,9 @@
     }
 
     function setupPanelLayout() {
-      const { host, panel, handle, toggle, body } = panelUi;
+      const { host, panel, keyboardSurface, toggle, body } = panelUi;
       body.hidden = panelSettings.collapsed;
-      toggle.textContent = panelSettings.collapsed ? '展开 ▴' : '折叠 ▾';
+      toggle.textContent = panelSettings.collapsed ? '▴' : '▾';
       toggle.setAttribute('aria-label', panelSettings.collapsed ? '展开模型与档位面板' : '折叠模型与档位面板');
       toggle.setAttribute('aria-expanded', String(!panelSettings.collapsed));
       toggle.addEventListener('click', () => setPanelCollapsed(!panelSettings.collapsed));
@@ -722,19 +820,22 @@
         savePanelSettings();
         applyPanelPosition();
       });
-      handle.addEventListener('pointerdown', event => {
+      panel.addEventListener('pointerdown', event => {
         if (event.button !== 0 || drag) return;
+        const path = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+        if (path.some(item => item && item.nodeType === 1 && item.matches?.('button,select,a,input,textarea,[data-chatgpt-panel-control]'))) return;
         const rect = host.getBoundingClientRect();
         drag = {
           pointerId: event.pointerId, x: event.clientX, y: event.clientY,
           start: { right: Math.max(0, win.innerWidth - rect.right), bottom: Math.max(0, win.innerHeight - rect.bottom) },
           position: null, moved: false
         };
-        try { handle.setPointerCapture(event.pointerId); }
+        panel.classList.add('is-dragging');
+        try { panel.setPointerCapture(event.pointerId); }
         catch (_) { finishDrag(true); return; }
         event.preventDefault();
       });
-      handle.addEventListener('pointermove', event => {
+      panel.addEventListener('pointermove', event => {
         if (!drag || drag.pointerId !== event.pointerId) return;
         const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
         if (!drag.moved && Math.hypot(dx, dy) <= 5) return;
@@ -744,10 +845,10 @@
           { width: win.innerWidth, height: win.innerHeight }, { width: rect.width, height: rect.height });
         applyPanelPosition();
       });
-      handle.addEventListener('pointerup', event => { if (drag?.pointerId === event.pointerId) finishDrag(false); });
-      handle.addEventListener('pointercancel', event => { if (drag?.pointerId === event.pointerId) finishDrag(true); });
-      handle.addEventListener('lostpointercapture', event => { if (drag?.pointerId === event.pointerId) finishDrag(true); });
-      handle.addEventListener('keydown', event => {
+      panel.addEventListener('pointerup', event => { if (drag?.pointerId === event.pointerId) finishDrag(false); });
+      panel.addEventListener('pointercancel', event => { if (drag?.pointerId === event.pointerId) finishDrag(true); });
+      panel.addEventListener('lostpointercapture', event => { if (drag?.pointerId === event.pointerId) finishDrag(true); });
+      keyboardSurface.addEventListener('keydown', event => {
         if (event.key === 'Escape' && drag) { event.preventDefault(); finishDrag(true); return; }
         const delta = event.shiftKey ? 40 : 10;
         const moves = { ArrowLeft: [delta, 0], ArrowRight: [-delta, 0], ArrowUp: [0, delta], ArrowDown: [0, -delta] };
@@ -784,87 +885,60 @@
       const shadow = host.attachShadow({ mode: 'open' });
       const style = doc.createElement('style');
       style.textContent = `
-        :host { all: initial; position: fixed; right: 12px; bottom: 12px; z-index: 2147483647; display: block; width: min(290px, calc(100vw - 24px)); color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        :host { all: initial; position: fixed; right: 10px; bottom: 10px; z-index: 2147483647; display: block; width: min(224px, calc(100vw - 16px)); color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         * { box-sizing: border-box; }
-        .panel { width: 100%; border: 1px solid rgba(255,255,255,.12); border-radius: 11px; background: rgba(30,33,39,.96); color: #f4f5f7; box-shadow: 0 6px 20px rgba(0,0,0,.2); backdrop-filter: blur(12px); }
-        .header { display: flex; align-items: center; gap: 5px; min-width: 0; padding: 5px 7px; }
-        .handle { flex: none; cursor: grab; touch-action: none; user-select: none; color: #bfc5ce; border-radius: 4px; padding: 3px; font-size: 16px; line-height: 1; }
-        .handle:active { cursor: grabbing; }
-        .short { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; }
-        .short-state { flex: none; color: #9fc7ff; font-size: 11px; white-space: nowrap; }
-        .toggle { flex: none; min-height: 24px; padding: 2px 5px; border: 0; background: transparent; font-size: 11px; }
-        .body { max-height: calc(100vh - 65px); overflow-y: auto; padding: 0 10px 10px; border-top: 1px solid rgba(255,255,255,.08); }
+        .panel { width: 100%; border: 1px solid rgba(255,255,255,.14); border-radius: 13px; background: rgba(25,28,34,.96); color: #f4f5f7; box-shadow: 0 8px 26px rgba(0,0,0,.28); backdrop-filter: blur(16px); cursor: grab; touch-action: manipulation; }
+        .panel.is-dragging { cursor: grabbing; user-select: none; touch-action: none; }
+        .header { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 36px; padding: 3px 5px 3px 11px; border-radius: 12px 12px 0 0; }
+        .short { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #f5f7fb; font-size: 12px; font-weight: 600; letter-spacing: .01em; }
+        .toggle { flex: none; width: 30px; height: 30px; min-height: 30px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: #c9d5e4; font-size: 17px; font-weight: 700; line-height: 1; }
+        .toggle:hover:not(:disabled) { background: rgba(137,183,255,.12); }
+        .body { max-height: calc(100vh - 65px); overflow-y: auto; padding: 7px 8px 8px; border-top: 1px solid rgba(255,255,255,.08); }
         .body[hidden] { display: none; }
-        .status { margin: 7px 0 0; color: #9fc7ff; font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
-        .fields { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 6px; margin-top: 7px; }
-        .label { display: block; min-width: 0; color: #aeb5c0; font-size: 11px; }
-        select, button { min-height: 30px; border: 1px solid #4b515d; border-radius: 6px; background: #262a32; color: #f4f5f7; font: inherit; font-size: 12px; }
-        select { display: block; width: 100%; min-width: 0; margin-top: 3px; padding: 0 5px; text-overflow: ellipsis; }
+        .model-list { display: grid; gap: 6px; }
+        .model-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(88px, .9fr); gap: 5px; align-items: center; min-width: 0; padding: 4px; border: 1px solid rgba(255,255,255,.10); border-radius: 10px; background: rgba(39,43,51,.76); transition: border-color 160ms ease, background 160ms ease; }
+        .model-row[data-selected="true"] { border-color: rgba(130,184,255,.72); background: rgba(53,72,98,.62); }
+        .model-choice, .effort-choice, .tool { min-height: 32px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #f4f5f7; font: inherit; font-size: 12px; }
+        .model-choice { min-width: 0; overflow: hidden; padding: 0 7px; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; cursor: pointer; }
+        .model-row[data-selected="true"] .model-choice::before { content: '✓'; display: inline-block; margin-right: 5px; color: #a9d0ff; font-size: 11px; }
+        .effort-choice { display: block; width: 100%; min-width: 0; padding: 0 7px; background: rgba(16,19,24,.56); text-overflow: ellipsis; cursor: pointer; }
+        .effort-choice:disabled, .model-choice:disabled { opacity: .5; cursor: default; }
         option { background: #262a32; color: #f4f5f7; }
         option:disabled { color: #999; }
-        button { padding: 4px 9px; cursor: pointer; }
-        button:hover:not(:disabled), button:focus-visible, select:focus-visible, .handle:focus-visible { border-color: #83b8ff; outline: 2px solid #83b8ff; outline-offset: 1px; }
-        button:disabled, select:disabled { opacity: .6; cursor: default; }
-        .summary { margin: 6px 0 0; color: #bfc5ce; font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
-        .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-top: 7px; }
-        .storage-note { margin: 6px 0 0; color: #ffca84; font-size: 11px; }
-        .primary { border-color: #53779f; background: #233e5a; font-weight: 600; }
+        button:hover:not(:disabled), button:focus-visible, select:focus-visible, .header:focus-visible { border-color: #83b8ff; outline: 2px solid #83b8ff; outline-offset: 1px; }
+        button:disabled, select:disabled { cursor: default; }
+        .visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
+        .actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: 5px; }
+        .tool { width: 28px; min-height: 28px; padding: 0; color: #aeb9c8; font-size: 14px; line-height: 1; cursor: pointer; }
+        .tool:hover:not(:disabled) { background: rgba(137,183,255,.12); color: #eaf3ff; }
+        .storage-note { margin: 5px 0 0; color: #ffca84; font-size: 10px; }
       `;
       const panel = doc.createElement('section'); panel.className = 'panel'; panel.setAttribute('aria-label', 'ChatGPT 模型与档位');
       const header = doc.createElement('div'); header.className = 'header';
-      const handle = doc.createElement('span'); handle.className = 'handle'; handle.textContent = '⠿'; handle.tabIndex = 0;
-      handle.setAttribute('role', 'group'); handle.setAttribute('aria-label', '移动面板，使用方向键，按住 Shift 可加快移动');
-      handle.dataset.chatgptPanelLayout = '';
-      const short = doc.createElement('span'); short.className = 'short';
-      const shortState = doc.createElement('span'); shortState.className = 'short-state'; shortState.setAttribute('aria-live', 'polite');
+      header.tabIndex = 0;
+      header.setAttribute('role', 'group'); header.setAttribute('aria-label', '移动面板，使用方向键，按住 Shift 可加快移动');
+      const short = doc.createElement('span'); short.className = 'short'; short.setAttribute('aria-live', 'polite');
       const toggle = doc.createElement('button'); toggle.className = 'toggle'; toggle.type = 'button'; toggle.dataset.chatgptPanelLayout = '';
       toggle.setAttribute('aria-controls', 'chatgpt-panel-body');
-      header.append(handle, short, shortState, toggle);
+      toggle.title = '展开或折叠模型面板';
+      header.append(short, toggle);
       const body = doc.createElement('div'); body.className = 'body'; body.id = 'chatgpt-panel-body';
-      const statusNode = doc.createElement('p'); statusNode.className = 'status'; statusNode.setAttribute('aria-live', 'polite');
-      const fields = doc.createElement('div'); fields.className = 'fields';
-      const modelLabel = doc.createElement('label'); modelLabel.className = 'label'; modelLabel.textContent = '模型';
-      const model = doc.createElement('select'); model.setAttribute('aria-label', '选择模型');
-      model.dataset.chatgptPanelControl = '';
-      modelLabel.append(model);
-      const effortLabelNode = doc.createElement('label'); effortLabelNode.className = 'label'; effortLabelNode.textContent = '强度';
-      const effort = doc.createElement('select'); effort.setAttribute('aria-label', '选择强度');
-      effort.dataset.chatgptPanelControl = '';
-      effortLabelNode.append(effort);
-      fields.append(modelLabel, effortLabelNode);
-      const current = doc.createElement('p'); current.className = 'summary';
-      const defaultValue = doc.createElement('p'); defaultValue.className = 'summary';
+      const statusNode = doc.createElement('p'); statusNode.className = 'visually-hidden'; statusNode.setAttribute('aria-live', 'polite');
+      const modelList = doc.createElement('div'); modelList.className = 'model-list';
       const actions = doc.createElement('div'); actions.className = 'actions';
-      const saveDefault = doc.createElement('button'); saveDefault.className = 'primary'; saveDefault.type = 'button'; saveDefault.textContent = '设为默认'; saveDefault.setAttribute('aria-label', '设为新聊天默认');
-      const refresh = doc.createElement('button'); refresh.type = 'button'; refresh.textContent = '重新读取';
-      const resetPosition = doc.createElement('button'); resetPosition.type = 'button'; resetPosition.textContent = '回到右下角'; resetPosition.dataset.chatgptPanelLayout = '';
+      const saveDefault = doc.createElement('button'); saveDefault.className = 'tool'; saveDefault.type = 'button'; saveDefault.textContent = '☆'; saveDefault.title = '设为新聊天默认'; saveDefault.setAttribute('aria-label', '设为新聊天默认');
+      const refresh = doc.createElement('button'); refresh.className = 'tool'; refresh.type = 'button'; refresh.textContent = '↻'; refresh.title = '重新读取原生控件'; refresh.setAttribute('aria-label', '重新读取原生控件');
+      const resetPosition = doc.createElement('button'); resetPosition.className = 'tool'; resetPosition.type = 'button'; resetPosition.textContent = '⌖'; resetPosition.title = '回到右下角'; resetPosition.setAttribute('aria-label', '回到右下角'); resetPosition.dataset.chatgptPanelLayout = '';
       const storageNote = doc.createElement('p'); storageNote.className = 'storage-note'; storageNote.textContent = '无法保存面板位置和折叠状态';
       saveDefault.dataset.chatgptPanelControl = '';
       refresh.dataset.chatgptPanelControl = '';
       actions.append(resetPosition, saveDefault, refresh);
-      body.append(statusNode, fields, current, defaultValue, storageNote, actions);
+      body.append(statusNode, modelList, storageNote, actions);
       panel.append(header, body);
       shadow.append(style, panel);
       doc.body.append(host);
-      panelUi = { host, shadow, panel, body, handle, short, shortState, toggle, storageNote, resetPosition, model, effort, current, defaultValue, status: statusNode, saveDefault, refresh, catalogKey: '' };
+      panelUi = { host, shadow, panel, dragSurface: panel, body, keyboardSurface: header, short, toggle, storageNote, resetPosition, modelList, modelRows: new Map(), status: statusNode, saveDefault, refresh, catalogKey: '' };
       setupPanelLayout();
-      model.addEventListener('change', event => {
-        if (!event.isTrusted) return;
-        const selected = catalog.find(item => item.key === model.value);
-        if (!selected || selected.disabled) { status('该模型不可用，未更改偏好'); return; }
-        route();
-        pendingChoice = { modelKey: selected.key, modelLabel: selected.label, effortKey: null, effortLabel: '', effortState: 'unknown' };
-        verified = ''; blocked = ''; status('等待空闲后应用所选模型'); schedule(1500);
-      });
-      effort.addEventListener('change', event => {
-        if (!event.isTrusted) return;
-        const selected = catalog.find(item => item.key === model.value);
-        const chosenEffort = effortOptions.find(item => item.key === effort.value);
-        if (!selected || !chosenEffort || effortModelKey !== selected.key) { status('当前模型的档位尚未确认'); return; }
-        route();
-        pendingChoice = { modelKey: selected.key, modelLabel: selected.label, effortKey: chosenEffort.key, effortLabel: chosenEffort.label, effortState: 'value' };
-        verified = ''; blocked = ''; status('等待空闲后应用所选档位'); schedule(1500);
-      });
       saveDefault.addEventListener('click', event => {
         if (!event.isTrusted || !confirmedPreference || statusText !== '已确认' || confirmedPreference.effortState === 'unknown') return;
         try {
@@ -907,6 +981,7 @@
       pendingSend = null;
       pendingChoice = null;
       pendingNativeCapture = false;
+      conversationPreference = null;
       confirmedPreference = null;
       verified = ''; blocked = ''; lastObservedButton = '';
       effortOptions = []; effortModelKey = '';
@@ -952,7 +1027,7 @@
         if (control.matches('a')) pendingSend = null;
         if (/^(?:新聊天|New chat)$/i.test(normalize(control.getAttribute('aria-label') || control.textContent))) {
           prefs.resetDraft(key);
-          pendingSend = null; pendingChoice = null; pendingNativeCapture = false; verified = ''; blocked = '';
+          pendingSend = null; pendingChoice = null; pendingNativeCapture = false; conversationPreference = null; verified = ''; blocked = '';
           renderPanel();
         }
       }
@@ -970,6 +1045,7 @@
       const preference = normalizePreference(read.preference);
       if (!preference) throw new Error('手动选择的模型偏好无法保存');
       prefs.save(key, preference);
+      rememberConversationPreference(preference);
       pendingNativeCapture = false;
       pendingChoice = null;
       confirmedPreference = preference.effortState === 'unknown' ? null : preference;
@@ -990,7 +1066,8 @@
       const button = picker();
       if (!button) { status('等待 ChatGPT 原生模型控件'); return; }
       const buttonText = normalize(button.textContent);
-      const desired = pendingChoice || prefs.ensure(key);
+      const requestedChoice = pendingChoice;
+      const desired = desiredConversationPreference();
       const signature = targetSignature(desired, buttonText);
       if (blocked.startsWith('native-unavailable|') && !pendingChoice && !pendingNativeCapture) return;
       if (!pendingNativeCapture && !pendingChoice && (verified === signature || blocked === signature)) return;
@@ -1044,7 +1121,7 @@
           if (desired.effortState === 'value') {
             chosen = findEffortOption(effortState.options, { ...desired, modelKey: selected.key });
           }
-          if (desired.effortState === 'unknown' && pendingChoice && pendingChoice.effortState === 'unknown') chosen = effortState.current;
+          if (desired.effortState === 'unknown' && requestedChoice && requestedChoice.effortState === 'unknown') chosen = effortState.current;
           if (!chosen) throw new Error('目标档位不在该模型当前提供的原生选项中');
           let verifiedEffort = effortState.current;
           if (!effortState.current || effortState.current.key !== chosen.key) {
@@ -1052,7 +1129,7 @@
           }
           verifiedEffort = currentEffort();
           if (verifiedEffort.state !== 'range' || verifiedEffort.value !== chosen.value) throw new Error('强度档位没有通过原生滑杆值确认');
-          const actualLabel = readEffortCaption(verifiedEffort.menu);
+          const actualLabel = resolveEffortLabel(chosen.label, readEffortCaption(verifiedEffort.menu));
           const resolvedOptions = effortState.options.map(option =>
             option.value === chosen.value && actualLabel ? { ...option, label: actualLabel } : option
           );
@@ -1065,7 +1142,7 @@
             effortState: 'value'
           };
         } else if (effortState.kind === 'none') {
-          if (desired.effortState === 'value' && !(pendingChoice && pendingChoice.effortState === 'unknown')) throw new Error('已保存的档位与该模型当前控件不匹配');
+          if (desired.effortState === 'value' && !(requestedChoice && requestedChoice.effortState === 'unknown')) throw new Error('已保存的档位与该模型当前控件不匹配');
           confirmed = { modelKey: selected.key, modelLabel: selected.label, effortKey: null, effortLabel: '', effortState: 'none' };
         } else {
           if (desired.effortState === 'value') throw new Error(effortState.reason || '强度控件无法识别');
@@ -1073,6 +1150,7 @@
         }
         check();
         prefs.save(key, confirmed);
+        if (requestedChoice) rememberConversationPreference(confirmed);
         pendingChoice = null; pendingNativeCapture = false;
         confirmedPreference = confirmed.effortState === 'unknown' ? null : confirmed;
         applied = confirmed;
@@ -1122,7 +1200,10 @@
       attributeFilter: ['aria-valuenow', 'aria-checked', 'aria-expanded', 'aria-disabled', 'disabled']
     });
     win.addEventListener('storage', event => {
-      if (event.key?.startsWith(PREFIX)) { verified = ''; blocked = ''; renderPanel(); schedule(); }
+      if (event.key?.startsWith(PREFIX)) {
+        conversationPreference = null;
+        verified = ''; blocked = ''; renderPanel(); schedule();
+      }
     });
     win.addEventListener('popstate', () => { pendingSend = null; schedule(); });
     win.addEventListener('blur', () => { pointerDown = false; });
@@ -1166,6 +1247,8 @@
     readPanelSettings,
     clampPanelPosition,
     panelSummary,
+    resolveConversationPreference,
+    resolveEffortLabel,
     start
   };
 });

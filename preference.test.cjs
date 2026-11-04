@@ -18,7 +18,9 @@ const {
   normalizePanelSettings,
   readPanelSettings,
   clampPanelPosition,
-  panelSummary
+  panelSummary,
+  resolveConversationPreference,
+  resolveEffortLabel
 } = require('./ChatGPT_56_Preference.user.js');
 
 function memory() {
@@ -57,12 +59,25 @@ test('面板位置按视口和展开后的高度限制，原始偏好不变', ()
   assert.deepEqual(clampPanelPosition({ right: -4, bottom: -8 }, { width: 200, height: 100 }, { width: 290, height: 200 }), { right: 0, bottom: 0 });
 });
 
-test('摘要区分目标、网页确认与不可用', () => {
+test('折叠摘要只显示网页已核对的模型与强度', () => {
   const wanted = DEFAULT_PREFERENCE;
-  assert.deepEqual(panelSummary(wanted, wanted, '已确认', true), { text: 'GPT-5.6 Sol · Medium', state: '已确认' });
-  assert.deepEqual(panelSummary(wanted, wanted, '等待空闲', false), { text: '目标：GPT-5.6 Sol · Medium', state: '等待' });
-  assert.equal(panelSummary(wanted, null, '不可用：限额', false).state, '不可用');
-  assert.equal(panelSummary(wanted, null, '暂停：无法识别', false).state, '未确认');
+  assert.deepEqual(panelSummary(wanted, wanted), { text: 'GPT-5.6 · Medium', state: '' });
+  assert.deepEqual(panelSummary(wanted, null), { text: '', state: '' });
+});
+
+test('当前会话的用户选择优先于默认值，切换会话后才回到保存值', () => {
+  const saved = { ...DEFAULT_PREFERENCE };
+  const userChoice = { ...saved, effortKey: effortValueKey(saved.modelKey, 3), effortLabel: 'Extra High' };
+  assert.equal(resolveConversationPreference(saved, null, null), saved);
+  assert.equal(resolveConversationPreference(saved, userChoice, saved).effortKey, userChoice.effortKey);
+  assert.equal(resolveConversationPreference(saved, null, userChoice).effortKey, userChoice.effortKey);
+});
+
+test('强度标签不会用滞后的原生状态覆盖已确认档位', () => {
+  assert.equal(resolveEffortLabel('Extra High', 'Medium'), 'Extra High');
+  assert.equal(resolveEffortLabel('极高', 'Extra High'), 'Extra High');
+  assert.equal(resolveEffortLabel('原生第 4 档', 'Extra High'), 'Extra High');
+  assert.equal(resolveEffortLabel('Medium', 'Medium'), 'Medium');
 });
 
 test('初始默认组合为 GPT-5.6 Sol + Medium', () => {
