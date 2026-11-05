@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 模型与档位
 // @namespace    local.chatgpt-preference
-// @version      0.5.3
+// @version      0.5.4
 // @description  读取 ChatGPT 页面真实模型与档位，并按聊天保存已确认偏好。
 // @match        https://chatgpt.com/*
 // @run-at       document-end
@@ -17,7 +17,7 @@
 })(typeof window === 'undefined' ? null : window, function () {
   'use strict';
 
-  const VERSION = '0.5.3';
+  const VERSION = '0.5.4';
   const PANEL_KEY = 'chatgpt-model-panel-v1';
   const PREFIX = 'chatgpt-model-preference-v2:';
   const LEGACY_PREFIX = 'chatgpt-56-preference-v1:';
@@ -61,12 +61,38 @@
   const panelModelLabel = value => /^GPT-5\.6\s+Sol$/i.test(normalize(value)) ? 'GPT-5.6' : normalize(value);
 
   function resolveCurrentModelPreference(catalog, saved, buttonText) {
-    const text = normalizedKey(buttonText);
+    const rawText = normalize(buttonText);
+    const text = normalizedKey(rawText);
+    // The model button can include its effort after a separator. Keep the full
+    // readable model name before that separator so variants such as GPT-6 Thinking
+    // don't collapse to GPT-6 when the model catalog is unavailable or incomplete.
+    const modelText = rawText.split(/\s*[·•]\s*/, 1)[0];
+    const observedLabel = modelText.match(/\bGPT-\s*\d+(?:\.\d+)*(?:\s+[A-Za-z][A-Za-z0-9._-]*)*/i)?.[0] || '';
+    if (observedLabel) {
+      const observedKey = normalizedKey(panelModelLabel(observedLabel));
+      const exactMatches = (catalog || []).filter(item =>
+        normalizedKey(panelModelLabel(item.label)) === observedKey
+      );
+      if (exactMatches.length === 1) return exactMatches[0];
+      if (exactMatches.length > 1) return null;
+
+      // A visible model name describes the page's current model, not the saved target.
+      // Keep the saved key only when the button explicitly confirms that exact model.
+      const sameAsSaved = saved?.modelLabel &&
+        normalizedKey(panelModelLabel(saved.modelLabel)) === normalizedKey(panelModelLabel(observedLabel));
+      return sameAsSaved
+        ? createModelOption({ key: saved.modelKey, label: saved.modelLabel })
+        : createModelOption({ label: observedLabel });
+    }
+
+    // Some native controls show only a shortened family label such as "5.6 中".
+    // Use the catalog only when the visible text doesn't expose a complete GPT name.
     const candidates = (catalog || []).map(item => {
       const fragment = normalizedKey(panelModelLabel(item.label).replace(/^gpt-/i, ''));
       return fragment && text.includes(fragment) ? { item, length: fragment.length } : null;
     }).filter(Boolean).sort((a, b) => b.length - a.length);
-    return candidates[0]?.item || createModelOption({ key: saved?.modelKey, label: saved?.modelLabel });
+    if (candidates[0]?.item) return candidates[0].item;
+    return null;
   }
 
   function normalizePanelSettings(value) {
@@ -1043,6 +1069,7 @@
       const saved = prefs.ensure(key);
       const buttonText = readNativeModelText(button);
       const model = currentModelPreference(saved, buttonText);
+      if (!model?.key || !model?.label) throw new Error('页面当前模型名称无法确认');
       const current = currentEffort();
       const statusText = current.menu ? readEffortStatus(current.menu).raw : current.statusText;
       const observationText = [current.accessibleLabel, statusText, buttonText].filter(Boolean).join(' · ');

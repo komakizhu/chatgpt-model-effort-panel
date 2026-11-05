@@ -591,10 +591,27 @@ test('目录尚未读取时也能用保存的模型字段构造当前观察值',
   const fallback = resolveCurrentModelPreference([], saved, 'GPT-5.6 · Medium');
   assert.equal(fallback.key, saved.modelKey);
   assert.equal(fallback.label, saved.modelLabel);
+  const actualGpt6 = resolveCurrentModelPreference([], saved, 'GPT-6 · Medium');
+  assert.equal(actualGpt6.label, 'GPT-6');
+  assert.notEqual(actualGpt6.key, saved.modelKey);
+  assert.equal(resolveCurrentModelPreference([], saved, 'Medium'), null);
+  const savedThinking = {
+    ...saved,
+    modelKey: 'label:gpt-6 thinking',
+    modelLabel: 'GPT-6 Thinking'
+  };
+  const actualThinking = resolveCurrentModelPreference([], savedThinking, 'GPT-6 Thinking · Medium');
+  assert.equal(actualThinking.key, savedThinking.modelKey);
+  const thinkingFromDefault = resolveCurrentModelPreference([], saved, 'GPT-6 Thinking · Medium');
+  assert.equal(thinkingFromDefault.label, 'GPT-6 Thinking');
+  assert.notEqual(thinkingFromDefault.key, saved.modelKey);
   const catalog = [
     createModelOption({ label: 'GPT-6', stableId: 'gpt-6' }),
+    createModelOption({ label: 'GPT-6 Thinking', stableId: 'gpt-6-thinking' }),
     createModelOption({ label: 'GPT-5.6 Sol', stableId: 'gpt-56' })
   ];
+  assert.equal(resolveCurrentModelPreference(catalog, saved, 'GPT-6 Thinking · Medium').key, 'id:gpt-6-thinking');
+  assert.equal(resolveCurrentModelPreference([catalog[0]], saved, 'GPT-6 Thinking · Medium').label, 'GPT-6 Thinking');
   assert.equal(resolveCurrentModelPreference(catalog, saved, '5.6 中').key, 'id:gpt-56');
 });
 
