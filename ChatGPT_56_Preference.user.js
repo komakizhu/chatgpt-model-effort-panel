@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 模型与档位
 // @namespace    local.chatgpt-preference
-// @version      0.5.4
+// @version      0.6.0
 // @description  读取 ChatGPT 页面真实模型与档位，并按聊天保存已确认偏好。
 // @match        https://chatgpt.com/*
 // @run-at       document-end

@@ -1,6 +1,6 @@
 # Safari ChatGPT：模型与档位悬浮面板
 
-版本：0.5.4。此 Safari Userscripts 脚本只匹配 `https://chatgpt.com/*` 顶层页面，通过 ChatGPT 页面当前可读的模型与强度状态工作。
+版本：0.6.0。此 Safari Userscripts 脚本只匹配 `https://chatgpt.com/*` 顶层页面，通过 ChatGPT 页面当前可读的模型与强度状态工作。
 
 ## 使用
 
