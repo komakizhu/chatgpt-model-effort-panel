@@ -6,12 +6,14 @@ const {
   context,
   resolveCurrentModelPreference,
   DEFAULT_PREFERENCE,
+  PREFIX,
   effortLabelFromStatus,
   effortItemIndexFromStatus,
   effortLabelFromText,
   observeEffortPreference,
   createEffortBackendAdapter,
   confirmEffortWrite,
+  preferenceMatches,
   classifyModelAvailability,
   modelAvailabilityLabel,
   effortRowPresentation,
@@ -25,6 +27,13 @@ const {
   normalizePreference,
   isLimitHint,
   PANEL_KEY,
+  ENABLED_KEY,
+  readFeatureEnabled,
+  writeFeatureEnabled,
+  createFeatureLifecycle,
+  pageSummary,
+  observeCurrentEffort,
+  createFeatureToggleControl,
   normalizePanelSettings,
   readPanelSettings,
   clampPanelPosition,
@@ -37,7 +46,8 @@ const {
   panelEffortSlot,
   shouldPreventPanelMouseFocus,
   readVisibleModelCatalog,
-  createModelEffortControls
+  createModelEffortControls,
+  start
 } = require('./ChatGPT_56_Preference.user.js');
 
 function memory() {
@@ -53,24 +63,86 @@ function memory() {
 const noop = () => {};
 
 class TestElement {
-  constructor(tagName) {
+  constructor(tagName, ownerDocument = null) {
     this.tagName = tagName.toUpperCase();
+    this.nodeType = this.tagName === 'SHADOW-ROOT' ? 11 : 1;
+    this.ownerDocument = ownerDocument;
     this.children = [];
-    this.dataset = {};
     this.attributes = new Map();
     this.listeners = new Map();
     this.parentElement = null;
-    this.textContent = '';
+    this._textContent = '';
     this.disabled = false;
     this.hidden = false;
     this.focusCalls = 0;
+    this.style = {};
+    this.className = '';
+    this.shadowRoot = null;
+    this.dataset = new Proxy({}, {
+      get: (_target, key) => this.attributes.get('data-' + String(key).replace(/[A-Z]/g, letter => '-' + letter.toLowerCase())),
+      set: (_target, key, value) => {
+        this.attributes.set('data-' + String(key).replace(/[A-Z]/g, letter => '-' + letter.toLowerCase()), String(value));
+        return true;
+      }
+    });
+    this.classList = {
+      add: name => { if (!this.className.split(/\s+/).includes(name)) this.className = (this.className + ' ' + name).trim(); },
+      remove: name => { this.className = this.className.split(/\s+/).filter(item => item && item !== name).join(' '); },
+      contains: name => this.className.split(/\s+/).includes(name)
+    };
   }
 
   append(...elements) {
     for (const element of elements) {
+      if (element.parentElement) element.remove();
       element.parentElement = this;
       this.children.push(element);
     }
+  }
+
+  remove() {
+    if (!this.parentElement) return;
+    this.parentElement.children = this.parentElement.children.filter(child => child !== this);
+    this.parentElement = null;
+  }
+
+  contains(element) {
+    return element === this || this.children.some(child => child.contains(element));
+  }
+
+  get isConnected() {
+    let node = this;
+    while (node) {
+      if (node === this.ownerDocument?.documentElement) return true;
+      node = node.parentElement || node.host || null;
+    }
+    return false;
+  }
+
+  get textContent() {
+    return this._textContent + this.children.map(child => child.textContent).join('');
+  }
+
+  set textContent(value) {
+    for (const child of this.children) child.parentElement = null;
+    this.children = [];
+    this._textContent = String(value ?? '');
+  }
+
+  get innerText() { return this.textContent; }
+  set innerText(value) { this.textContent = value; }
+
+  getClientRects() {
+    let node = this;
+    while (node) {
+      if (node.hidden || node.style?.display === 'none') return [];
+      node = node.parentElement || node.host || null;
+    }
+    return this.isConnected ? [{ width: 100, height: 30 }] : [];
+  }
+
+  getBoundingClientRect() {
+    return { left: 900, right: 1000, top: 800, bottom: 830, width: 100, height: 30 };
   }
 
   setAttribute(name, value) {
@@ -78,6 +150,7 @@ class TestElement {
   }
 
   getAttribute(name) {
+    if (name === 'class') return this.className || null;
     return this.attributes.has(name) ? this.attributes.get(name) : null;
   }
 
@@ -87,20 +160,260 @@ class TestElement {
     this.listeners.set(name, callbacks);
   }
 
-  click(isTrusted = true) {
-    if (this.disabled) return;
-    for (const callback of this.listeners.get('click') || []) {
-      callback({ type: 'click', isTrusted, preventDefault() {} });
+  removeEventListener(name, callback) {
+    this.listeners.set(name, (this.listeners.get(name) || []).filter(item => item !== callback));
+  }
+
+  dispatchEvent(event) {
+    event.target = this;
+    const path = [];
+    let node = this;
+    while (node) {
+      path.push(node);
+      node = node.parentElement || node.host || null;
     }
+    for (node of path) {
+      event.currentTarget = node;
+      for (const callback of node.listeners?.get(event.type) || []) callback(event);
+      if (event.bubbles === false) break;
+    }
+    return true;
+  }
+
+  click(isTrusted = false) {
+    if (this.disabled) return;
+    this.dispatchEvent({ type: 'click', isTrusted, bubbles: true, cancelable: true, preventDefault() {} });
   }
 
   focus() {
     this.focusCalls++;
   }
+
+  setPointerCapture() {}
+  releasePointerCapture() {}
+  hasPointerCapture() { return false; }
+
+  attachShadow() {
+    const shadow = new TestElement('shadow-root', this.ownerDocument);
+    shadow.host = this;
+    this.shadowRoot = shadow;
+    return shadow;
+  }
+
+  matches(selector) {
+    return String(selector).split(',').some(part => {
+      let query = part.trim();
+      if (!query) return false;
+      const tag = query.match(/^[a-z][a-z0-9-]*/i)?.[0];
+      if (tag && tag.toUpperCase() !== this.tagName) return false;
+      if (!tag && /^[a-z][a-z0-9-]*$/i.test(query)) return false;
+      if (query.includes(':disabled') && !(this.disabled || this.getAttribute('aria-disabled') === 'true')) return false;
+      for (const match of query.matchAll(/\[([^\]=]+)(?:=["']?([^"'\]]+)["']?)?\]/g)) {
+        const [, name, value] = match;
+        const actual = this.getAttribute(name);
+        if (actual === null || (value !== undefined && actual !== value)) return false;
+      }
+      for (const match of query.matchAll(/\.([a-zA-Z0-9_-]+)/g)) {
+        if (!this.classList.contains(match[1])) return false;
+      }
+      return true;
+    });
+  }
+
+  closest(selector) {
+    let node = this;
+    while (node) {
+      if (node.matches?.(selector)) return node;
+      node = node.parentElement || node.host || null;
+    }
+    return null;
+  }
+
+  querySelectorAll(selector) {
+    const found = [];
+    const visit = node => {
+      for (const child of node.children) {
+        if (child.matches(selector)) found.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return found;
+  }
+
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 }
 
 function testDocument() {
-  return { createElement: tagName => new TestElement(tagName) };
+  const doc = new TestElement('document');
+  doc.nodeType = 9;
+  doc.readyState = 'complete';
+  doc.hidden = false;
+  doc.documentElement = new TestElement('html', doc);
+  doc.body = new TestElement('body', doc);
+  doc.append(doc.documentElement);
+  doc.documentElement.append(doc.body);
+  doc.createElement = tagName => new TestElement(tagName, doc);
+  doc.querySelectorAll = selector => doc.documentElement.querySelectorAll(selector);
+  doc.querySelector = selector => doc.querySelectorAll(selector)[0] || null;
+  doc.getElementById = id => doc.querySelectorAll('[id="' + id + '"]')[0] || null;
+  return doc;
+}
+
+function fakeChatGPTWindow({
+  enabled = null,
+  currentModel = 'GPT-6',
+  currentEffort = 'Medium',
+  buttonShowsModel = true,
+  modelRows: rows = null,
+  onModelClick = null,
+  localStore = null
+} = {}) {
+  const document = testDocument();
+  const localStorage = localStore || memory(), sessionStorage = memory();
+  if (enabled !== null) localStorage.setItem(ENABLED_KEY, enabled ? 'on' : 'off');
+  const buttonText = () => buttonShowsModel && currentModel
+    ? currentModel + ' · ' + currentEffort
+    : currentEffort;
+  let menu = null, menuOpenCount = 0, modelClickCount = 0, observerCount = 0;
+  const picker = document.createElement('button');
+  picker.setAttribute('aria-label', '选择 ChatGPT 模型');
+  picker.textContent = buttonText();
+  document.body.append(picker);
+
+  const removeMenu = () => {
+    const removed = menu;
+    menu?.remove();
+    menu = null;
+    return removed;
+  };
+  document.documentElement.addEventListener('pointerdown', event => {
+    if (menu && !menu.contains(event.target)) removeMenu();
+  });
+  const composer = document.createElement('textarea');
+  document.body.append(composer);
+  const modelRows = () => rows || [
+    { label: 'GPT-5.6 Sol', stableId: 'gpt-56' },
+    { label: 'GPT-6', stableId: 'gpt-6' }
+  ];
+  picker.addEventListener('click', () => {
+    if (menu) { removeMenu(); return; }
+    menuOpenCount++;
+    menu = document.createElement('div');
+    menu.setAttribute('role', 'menu');
+    const chooser = document.createElement('button');
+    chooser.setAttribute('role', 'menuitem');
+    chooser.setAttribute('aria-label', '选择模型');
+    chooser.addEventListener('click', () => {
+      menu.textContent = '';
+      const status = document.createElement('div');
+      status.setAttribute('role', 'status');
+      status.setAttribute('aria-live', 'polite');
+      status.textContent = currentEffort + '，第 2 项，共 5 项。';
+      menu.append(status);
+      for (const row of modelRows()) {
+        const item = document.createElement('button');
+        item.setAttribute('role', 'menuitemradio');
+        item.setAttribute('aria-label', row.label);
+        item.setAttribute('data-model-id', row.stableId);
+        if (row.disabled) item.setAttribute('aria-disabled', 'true');
+        if (row.reason) item.setAttribute('aria-description', row.reason);
+        item.setAttribute('aria-checked', String(currentModel === row.label));
+        item.addEventListener('click', () => {
+          modelClickCount++;
+          currentModel = row.label;
+          for (const sibling of menu.querySelectorAll('[role="menuitemradio"]')) {
+            sibling.setAttribute('aria-checked', String(sibling === item));
+          }
+          onModelClick?.({ currentModel, item, menu, window: win });
+          picker.textContent = buttonText();
+          const removed = removeMenu();
+          queueMicrotask(() => win.triggerMutation([{
+            type: 'childList', target: document.body, addedNodes: [],
+            removedNodes: removed ? [removed] : []
+          }]));
+        });
+        menu.append(item);
+      }
+    });
+    menu.append(chooser);
+    document.body.append(menu);
+  });
+
+  const observers = [];
+  class MutationObserverMock {
+    constructor(callback) { this.callback = callback; this.disconnected = false; observerCount++; observers.push(this); }
+    observe() {}
+    disconnect() { this.disconnected = true; }
+  }
+  class ResizeObserverMock {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  const intervals = new Map();
+  let nextInterval = 0;
+  let nextAnimation = 0;
+  const win = new TestElement('window', document);
+  Object.assign(win, {
+    document,
+    localStorage,
+    sessionStorage,
+    location: { pathname: '/c/test-chat' },
+    innerWidth: 1200,
+    innerHeight: 900,
+    top: null,
+    self: null,
+    Element: TestElement,
+    MutationObserver: MutationObserverMock,
+    ResizeObserver: ResizeObserverMock,
+    AbortController,
+    PointerEvent: class PointerEventMock {
+      constructor(type, options = {}) { this.type = type; Object.assign(this, options); }
+    },
+    getComputedStyle: element => ({ visibility: 'visible', display: element.hidden ? 'none' : 'block' }),
+    setTimeout: (callback, ms) => setTimeout(callback, ms),
+    clearTimeout: id => clearTimeout(id),
+    setInterval: callback => { const id = ++nextInterval; intervals.set(id, callback); return id; },
+    clearInterval: id => intervals.delete(id),
+    requestAnimationFrame: callback => { const id = ++nextAnimation; callback(); return id; },
+    cancelAnimationFrame() {},
+    get observerCount() { return observerCount; },
+    get observers() { return observers; },
+    get activeIntervals() { return intervals.size; },
+    get modelClickCount() { return modelClickCount; },
+    get menuOpenCount() { return menuOpenCount; },
+    get currentModel() { return currentModel; },
+    setCurrentModel(label, { showModel = buttonShowsModel } = {}) {
+      currentModel = label;
+      buttonShowsModel = showModel;
+      picker.textContent = buttonText();
+    },
+    setButtonShowsModel(showModel) {
+      buttonShowsModel = Boolean(showModel);
+      picker.textContent = buttonText();
+    },
+    triggerMutation(records = []) {
+      for (const observer of observers) {
+        if (!observer.disconnected) observer.callback(records);
+      }
+    },
+    composer,
+    picker,
+    localStorage,
+    sessionStorage,
+    removeMenu
+  });
+  win.top = win.self = win;
+  Object.defineProperties(win, {
+    observerCount: { get: () => observerCount },
+    observers: { get: () => observers },
+    activeIntervals: { get: () => intervals.size },
+    modelClickCount: { get: () => modelClickCount },
+    menuOpenCount: { get: () => menuOpenCount },
+    currentModel: { get: () => currentModel }
+  });
+  return win;
 }
 
 function descendants(node) {
@@ -121,6 +434,284 @@ test('无效面板数据回退默认，存储不可用有独立状态', () => {
   assert.deepEqual(normalizePanelSettings({ collapsed: false, position: { right: -1, bottom: 2 } }),
     { collapsed: true, position: null });
   assert.equal(readPanelSettings({ getItem() { throw new Error('blocked'); } }).available, false);
+});
+
+test('脚本开关首次默认开启、关闭后持久关闭，损坏或不可读时保守停用', () => {
+  const store = memory();
+  assert.deepEqual(readFeatureEnabled(store), { enabled: true, available: true, reason: '' });
+  assert.deepEqual(writeFeatureEnabled(store, false), { ok: true });
+  assert.deepEqual(readFeatureEnabled(store), { enabled: false, available: true, reason: '' });
+  store.setItem(ENABLED_KEY, 'corrupt');
+  assert.equal(readFeatureEnabled(store).enabled, false);
+  assert.match(readFeatureEnabled(store).reason, /无法识别/);
+  assert.deepEqual(readFeatureEnabled({ getItem() { throw new Error('blocked'); } }), {
+    enabled: false, available: false, reason: '无法读取脚本开关设置，已停用'
+  });
+});
+
+test('脚本生命周期重复开启或关闭不会重复注册与清理', () => {
+  const calls = { enable: 0, disable: 0 };
+  const lifecycle = createFeatureLifecycle(false, {
+    enable: () => { calls.enable++; },
+    disable: () => { calls.disable++; }
+  });
+  assert.equal(lifecycle.set(false), false);
+  assert.equal(lifecycle.set(true), true);
+  assert.equal(lifecycle.set(true), false);
+  assert.equal(lifecycle.set(false), true);
+  assert.equal(lifecycle.set(false), false);
+  assert.deepEqual(calls, { enable: 1, disable: 1 });
+});
+
+test('页面未知模型时仍显示真实档位，且序号不匹配时不确认档位', () => {
+  assert.deepEqual(pageSummary({
+    model: null,
+    preference: null,
+    effort: observeCurrentEffort({ state: 'unknown', label: 'Medium' }, 'Medium')
+  }), { text: '模型未确认 · Medium', state: '' });
+  assert.deepEqual(observeCurrentEffort({
+    state: 'range', value: 1, min: 0, max: 4, itemIndex: 4, label: 'Medium'
+  }, 'Medium，第 4 项，共 5 项。'), {
+    state: 'unknown', label: '', value: 1, min: 0, max: 4, reason: '页面档位名称与位置不一致'
+  });
+});
+
+test('总开关通过可访问的 switch 控件通知并反映持久状态', () => {
+  let enabled = true;
+  const control = createFeatureToggleControl(testDocument(), () => { enabled = !enabled; });
+  control.update(enabled);
+  assert.equal(control.button.getAttribute('role'), 'switch');
+  assert.equal(control.button.getAttribute('aria-checked'), 'true');
+  assert.equal(control.button.getAttribute('aria-label'), '关闭脚本');
+  control.button.click(true);
+  control.update(enabled);
+  assert.equal(control.button.getAttribute('aria-checked'), 'false');
+  assert.equal(control.button.getAttribute('aria-label'), '开启脚本');
+});
+
+test('实际启动流程尊重总开关，启用后只切一次，关闭后撤下页面观察', async () => {
+  const win = fakeChatGPTWindow({ enabled: false, currentModel: 'GPT-6' });
+  const app = start(win);
+  const host = win.document.body.children.find(element => element.dataset.chatgptModelPanel);
+  const featureSwitch = host.shadowRoot.querySelector('.feature-switch');
+  assert.equal(app.enabled, false);
+  assert.equal(app.active, false);
+  assert.equal(win.observerCount, 0);
+  assert.equal(win.activeIntervals, 0);
+  assert.equal(win.document.listeners.get('input')?.length || 0, 0);
+
+  featureSwitch.click(true);
+  assert.equal(app.enabled, true);
+  assert.equal(app.active, true);
+  assert.equal(win.observerCount, 1);
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(win.currentModel, 'GPT-5.6 Sol', JSON.stringify(app.diagnostics));
+  assert.equal(win.modelClickCount, 1);
+  assert.equal(win.menuOpenCount, 1);
+
+  await app.reconcile();
+  assert.equal(win.modelClickCount, 1);
+  assert.equal(win.menuOpenCount, 1);
+  const preferenceKey = PREFIX + 'chat:test-chat';
+  const savedBeforeDisable = win.localStorage.getItem(preferenceKey);
+
+  featureSwitch.click(true);
+  assert.equal(app.enabled, false);
+  assert.equal(app.active, false);
+  assert.equal(win.activeIntervals, 0);
+  assert.equal(win.document.listeners.get('input')?.length || 0, 0);
+  assert.ok(win.observers.every(observer => observer.disconnected));
+  win.setCurrentModel('GPT-6');
+  await app.reconcile();
+  assert.equal(win.currentModel, 'GPT-6');
+  assert.equal(win.modelClickCount, 1);
+  assert.equal(win.localStorage.getItem(preferenceKey), savedBeforeDisable);
+
+  featureSwitch.click(true);
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(app.enabled, true);
+  assert.equal(win.currentModel, 'GPT-5.6 Sol');
+  assert.equal(win.modelClickCount, 2);
+  assert.equal(win.menuOpenCount, 2);
+});
+
+test('原生按钮只显示 Medium 时读取唯一勾选项，并复用关闭菜单的确认', async () => {
+  const win = fakeChatGPTWindow({ currentModel: 'GPT-6', buttonShowsModel: false });
+  const app = start(win);
+  await new Promise(resolve => setTimeout(resolve, 900));
+  assert.equal(win.currentModel, 'GPT-5.6 Sol', JSON.stringify(app.diagnostics));
+  assert.equal(win.modelClickCount, 1);
+  assert.equal(win.menuOpenCount, 1);
+  await app.reconcile();
+  assert.equal(win.modelClickCount, 1);
+  assert.equal(win.menuOpenCount, 1);
+  win.document.body.children.find(element => element.dataset.chatgptModelPanel)
+    .shadowRoot.querySelector('.feature-switch').click(true);
+});
+
+test('模型未确认时只探测一次，普通调度不会反复打开菜单', async () => {
+  const win = fakeChatGPTWindow({ currentModel: null, buttonShowsModel: false });
+  const app = start(win);
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(win.menuOpenCount, 1);
+  assert.equal(win.modelClickCount, 0);
+  assert.equal(app.diagnostics.blocked.kind, 'model-unconfirmed');
+  await app.reconcile();
+  await app.reconcile();
+  assert.equal(win.menuOpenCount, 1);
+  win.setCurrentModel('GPT-5.6 Sol', { showModel: true });
+  await app.reconcile();
+  assert.equal(app.diagnostics.observation.observation.modelState, 'confirmed');
+  assert.equal(win.menuOpenCount, 1);
+  win.document.body.children.find(element => element.dataset.chatgptModelPanel)
+    .shadowRoot.querySelector('.feature-switch').click(true);
+});
+
+test('页面模型已与默认目标一致时不打开菜单或重复点击', async () => {
+  const win = fakeChatGPTWindow({ currentModel: 'GPT-5.6 Sol' });
+  const app = start(win);
+  await new Promise(resolve => setTimeout(resolve, 550));
+  await app.reconcile();
+  assert.equal(win.currentModel, 'GPT-5.6 Sol');
+  assert.equal(win.menuOpenCount, 0);
+  assert.equal(win.modelClickCount, 0);
+  win.document.body.children.find(element => element.dataset.chatgptModelPanel)
+    .shadowRoot.querySelector('.feature-switch').click(true);
+});
+
+test('用户在等待切换期间开始输入会取消后续脚本操作并让调度恢复', async () => {
+  const win = fakeChatGPTWindow({
+    currentModel: 'GPT-6',
+    onModelClick: ({ window }) => {
+      window.composer.dispatchEvent({
+        type: 'input',
+        isTrusted: true,
+        bubbles: true,
+        composed: true,
+        preventDefault() {}
+      });
+    }
+  });
+  const app = start(win);
+  await new Promise(resolve => setTimeout(resolve, 1750));
+  assert.equal(win.currentModel, 'GPT-5.6 Sol');
+  assert.equal(win.modelClickCount, 1);
+  assert.equal(app.active, true);
+  await app.reconcile();
+  assert.equal(win.modelClickCount, 1);
+  win.document.body.children.find(element => element.dataset.chatgptModelPanel)
+    .shadowRoot.querySelector('.feature-switch').click(true);
+});
+
+test('用户手动确认的模型在当前聊天优先于默认值并跨刷新保存', async () => {
+  const win = fakeChatGPTWindow({
+    currentModel: 'GPT-5.6 Sol',
+    onModelClick: ({ window }) => window.setButtonShowsModel(false)
+  });
+  const app = start(win);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  win.picker.click(true);
+  win.document.querySelector('[role="menuitem"]').click(true);
+  win.document.querySelectorAll('[role="menuitemradio"]')
+    .find(item => item.getAttribute('aria-label') === 'GPT-6')
+    .click(true);
+  await new Promise(resolve => setTimeout(resolve, 1700));
+
+  assert.equal(win.currentModel, 'GPT-6');
+  const stored = JSON.parse(win.localStorage.getItem(PREFIX + 'chat:test-chat'));
+  assert.equal(stored.modelLabel, 'GPT-6');
+  assert.equal(stored.effortState, 'unknown');
+  await app.reconcile();
+  assert.equal(win.currentModel, 'GPT-6');
+  win.document.body.children.find(element => element.dataset.chatgptModelPanel)
+    .shadowRoot.querySelector('.feature-switch').click(true);
+
+  const reload = fakeChatGPTWindow({
+    localStore: win.localStorage,
+    currentModel: 'GPT-5.6 Sol'
+  });
+  reload.localStorage.setItem(ENABLED_KEY, 'on');
+  start(reload);
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.equal(reload.currentModel, 'GPT-6');
+  reload.document.body.children.find(element => element.dataset.chatgptModelPanel)
+    .shadowRoot.querySelector('.feature-switch').click(true);
+});
+
+test('聊天偏好存储失败时当前标签页保留已确认模型且不被默认值覆盖', async () => {
+  const values = new Map([[ENABLED_KEY, 'on']]);
+  const localStore = {
+    getItem(key) { return values.has(key) ? values.get(key) : null; },
+    setItem(key, value) {
+      if (key.startsWith(PREFIX)) throw new Error('quota exceeded');
+      values.set(key, String(value));
+    },
+    removeItem(key) { values.delete(key); }
+  };
+  const win = fakeChatGPTWindow({
+    currentModel: 'GPT-5.6 Sol',
+    localStore,
+    onModelClick: ({ window }) => window.setButtonShowsModel(false)
+  });
+  const app = start(win);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  win.picker.click(true);
+  win.document.querySelector('[role="menuitem"]').click(true);
+  win.document.querySelectorAll('[role="menuitemradio"]')
+    .find(item => item.getAttribute('aria-label') === 'GPT-6')
+    .click(true);
+  await new Promise(resolve => setTimeout(resolve, 1650));
+
+  assert.equal(win.currentModel, 'GPT-6');
+  assert.equal(win.localStorage.getItem(PREFIX + 'chat:test-chat'), null);
+  assert.match(app.diagnostics.statusText, /无法保存到浏览器/);
+  await app.reconcile();
+  assert.equal(win.currentModel, 'GPT-6');
+  win.document.body.children.find(element => element.dataset.chatgptModelPanel)
+    .shadowRoot.querySelector('.feature-switch').click(true);
+});
+
+test('存储访问失败时默认停用，用户仍可在当前标签页开启并看到未持久保存提示', () => {
+  const win = fakeChatGPTWindow({ enabled: false });
+  Object.defineProperty(win, 'localStorage', {
+    configurable: true,
+    get() { throw new Error('storage unavailable'); }
+  });
+  const app = start(win);
+  const host = win.document.body.children.find(element => element.dataset.chatgptModelPanel);
+  const feature = host.shadowRoot.querySelector('.feature-switch');
+  const state = host.shadowRoot.querySelector('.feature-state');
+  assert.equal(app.enabled, false);
+  assert.match(state.textContent, /无法读取脚本开关设置/);
+  feature.click(true);
+  assert.equal(app.enabled, true);
+  assert.match(state.textContent, /无法保存脚本开关状态/);
+  feature.click(true);
+});
+
+test('总开关跨标签同步，关闭状态在重新加载后仍然保留', () => {
+  const sharedStorage = memory();
+  sharedStorage.setItem(ENABLED_KEY, 'off');
+  const firstWindow = fakeChatGPTWindow({ localStore: sharedStorage });
+  const firstApp = start(firstWindow);
+  const secondWindow = fakeChatGPTWindow({ localStore: sharedStorage });
+  const secondApp = start(secondWindow);
+  assert.equal(firstApp.enabled, false);
+  assert.equal(secondApp.enabled, false);
+
+  sharedStorage.setItem(ENABLED_KEY, 'on');
+  firstWindow.dispatchEvent({ type: 'storage', key: ENABLED_KEY, bubbles: false });
+  secondWindow.dispatchEvent({ type: 'storage', key: ENABLED_KEY, bubbles: false });
+  assert.equal(firstApp.enabled, true);
+  assert.equal(secondApp.enabled, true);
+
+  sharedStorage.setItem(ENABLED_KEY, 'off');
+  firstWindow.dispatchEvent({ type: 'storage', key: ENABLED_KEY, bubbles: false });
+  secondWindow.dispatchEvent({ type: 'storage', key: ENABLED_KEY, bubbles: false });
+  assert.equal(firstApp.active, false);
+  assert.equal(secondApp.active, false);
+  assert.equal(firstWindow.activeIntervals, 0);
+  assert.equal(secondWindow.activeIntervals, 0);
 });
 
 test('面板位置按视口和展开后的高度限制，原始偏好不变', () => {
@@ -223,8 +814,8 @@ test('展开面板实际渲染固定模型和强度按钮，并只按页面确�
   assert.match(controls.effortButtons.get('pro').title, /选项未确认/);
   assert.equal(descendants(controls.element).some(node => node.tagName === 'SELECT'), false);
 
-  controls.modelButtons.get('gpt-6').click();
-  controls.effortButtons.get('medium').click();
+  controls.modelButtons.get('gpt-6').click(true);
+  controls.effortButtons.get('medium').click(true);
   assert.equal(modelSelections.length, 0);
   assert.equal(effortSelections.length, 0);
 
@@ -309,6 +900,19 @@ test('聊天偏好跨重载保存且互不覆盖', () => {
   const second = new Preferences(local, memory());
   assert.equal(second.ensure('chat:a').effortKey, effortValueKey(modelKey, 3));
   assert.equal(second.ensure('chat:b').effortKey, effortValueKey(modelKey, 1));
+});
+
+test('聊天偏好存储失败不会伪装成已持久保存', () => {
+  const failing = {
+    getItem() { return null; },
+    setItem() { throw new Error('quota exceeded'); },
+    removeItem() {}
+  };
+  const prefs = new Preferences(failing, failing);
+  assert.deepEqual(prefs.ensure('chat:volatile'), DEFAULT_PREFERENCE);
+  assert.equal(prefs.read('chat:volatile'), null);
+  assert.throws(() => prefs.save('chat:volatile', DEFAULT_PREFERENCE), /无法持久保存聊天偏好/);
+  assert.throws(() => prefs.setDefault(DEFAULT_PREFERENCE), /无法持久保存默认偏好/);
 });
 
 test('全局默认只影响之后首次进入的聊天', () => {
@@ -526,6 +1130,19 @@ test('写入只在页面于 5 秒内确认同一模型与档位后成功，失�
   assert.equal(cancelled.reason, '档位修改已取消');
 });
 
+test('重复强度名称不能替代数值确认', () => {
+  const modelKey = DEFAULT_PREFERENCE.modelKey;
+  const highAtTwo = {
+    modelKey, modelLabel: DEFAULT_PREFERENCE.modelLabel,
+    effortKey: effortValueKey(modelKey, 2), effortLabel: 'High', effortState: 'value'
+  };
+  const highAtThree = {
+    ...highAtTwo, effortKey: effortValueKey(modelKey, 3)
+  };
+  assert.equal(preferenceMatches(highAtTwo, highAtThree), false);
+  assert.equal(preferenceMatches(highAtTwo, highAtTwo), true);
+});
+
 test('档位逻辑不再聚焦原生滑杆或派发合成方向键', () => {
   const source = fs.readFileSync('ChatGPT_56_Preference.user.js', 'utf8');
   assert.doesNotMatch(source, /function\s+moveSliderTo\b/);
@@ -541,11 +1158,11 @@ test('档位逻辑不再聚焦原生滑杆或派发合成方向键', () => {
   const chooseEffort = source.slice(source.indexOf('function chooseEffort'), source.indexOf('function renderPanel'));
   assert.doesNotMatch(chooseEffort, /rememberConversationPreference/);
   const reconcile = source.slice(source.indexOf('async function reconcile'), source.indexOf("for (const type of ['pointerdown'"));
-  assert.match(reconcile, /if \(modelChoice\)[\s\S]*?readCatalogOnly/);
+  assert.match(reconcile, /if \(!actual\)[\s\S]*?openModelOptions/);
   assert.doesNotMatch(source, /pendingCatalogRefresh/);
   const catalogReader = source.slice(source.indexOf('function observeVisibleModelCatalog'), source.indexOf('function isChooser'));
   assert.match(catalogReader, /menus\(\)/);
-  assert.match(catalogReader, /readVisibleModelCatalog/);
+  assert.match(catalogReader, /readModelItems/);
   assert.doesNotMatch(catalogReader, /\.click\s*\(/);
   const panelCreation = source.slice(source.indexOf('function mountPanel'), source.indexOf('function schedule'));
   assert.doesNotMatch(panelCreation, /☆|⌖|↻|设为新聊天默认|重新读取原生控件|resetPosition|saveDefault|refresh|createElement\(['"]select/);
@@ -613,6 +1230,17 @@ test('目录尚未读取时也能用保存的模型字段构造当前观察值',
   assert.equal(resolveCurrentModelPreference(catalog, saved, 'GPT-6 Thinking · Medium').key, 'id:gpt-6-thinking');
   assert.equal(resolveCurrentModelPreference([catalog[0]], saved, 'GPT-6 Thinking · Medium').label, 'GPT-6 Thinking');
   assert.equal(resolveCurrentModelPreference(catalog, saved, '5.6 中').key, 'id:gpt-56');
+});
+
+test('模型读取可独立使用唯一已选目录项，且拒绝多选和文字冲突', () => {
+  const saved = { ...DEFAULT_PREFERENCE };
+  const gpt56 = createModelOption({ label: 'GPT-5.6 Sol', stableId: 'gpt-56' });
+  const gpt6 = createModelOption({ label: 'GPT-6', stableId: 'gpt-6' });
+  assert.equal(resolveCurrentModelPreference([gpt56, gpt6], saved, 'Medium', gpt56).key, gpt56.key);
+  assert.equal(resolveCurrentModelPreference([gpt56, gpt6], saved, '5.6 中', gpt56).key, gpt56.key);
+  assert.equal(resolveCurrentModelPreference([gpt56, gpt6], saved, 'Medium'), null);
+  assert.equal(resolveCurrentModelPreference([{ ...gpt56, checked: true }, { ...gpt6, checked: true }], saved, 'Medium'), null);
+  assert.equal(resolveCurrentModelPreference([gpt56, gpt6], saved, 'GPT-6 · Medium', gpt56), null);
 });
 
 test('只有用户可信的模型与强度操作会被识别为手动选择', () => {
