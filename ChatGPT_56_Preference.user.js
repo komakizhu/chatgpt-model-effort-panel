@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 模型与档位
 // @namespace    local.chatgpt-preference
-// @version      0.5.1
-// @description  通过原生控件选择模型与该模型支持的档位，并按聊天保存偏好。
+// @version      0.5.3
+// @description  读取 ChatGPT 页面真实模型与档位，并按聊天保存已确认偏好。
 // @match        https://chatgpt.com/*
 // @run-at       document-end
 // @inject-into  content
@@ -17,16 +17,37 @@
 })(typeof window === 'undefined' ? null : window, function () {
   'use strict';
 
-  const VERSION = '0.5.1';
+  const VERSION = '0.5.3';
   const PANEL_KEY = 'chatgpt-model-panel-v1';
   const PREFIX = 'chatgpt-model-preference-v2:';
   const LEGACY_PREFIX = 'chatgpt-56-preference-v1:';
-  const PICKER = 'button[aria-label="选择 ChatGPT 模型"],button[aria-label="Select ChatGPT model"]';
+  const PICKER = 'button[aria-label="选择 ChatGPT 模型"],button[aria-label="Select ChatGPT model"],[role="button"][aria-label="选择 ChatGPT 模型"],[role="button"][aria-label="Select ChatGPT model"]';
   const CHOOSER_LABELS = new Set(['选择模型', 'Choose model', 'Select model']);
   const DEFAULT_MODEL_LABEL = 'GPT-5.6 Sol';
   const DEFAULT_MODEL_KEY = 'label:gpt-5.6 sol';
   const DEFAULT_EFFORT_KEY = 'effort-value:' + encodeURIComponent(DEFAULT_MODEL_KEY) + ':1';
   const LEGACY_EFFORTS = ['Low', 'Medium', 'High', 'Extra High', 'Max'];
+  const EFFORT_LABEL_ALIASES = Object.freeze({
+    low: 'Low',
+    '即时': 'Instant',
+    instant: 'Instant',
+    '低': 'Low',
+    med: 'Medium',
+    mid: 'Medium',
+    medium: 'Medium',
+    '中': 'Medium',
+    '中等': 'Medium',
+    high: 'High',
+    '高': 'High',
+    'extra high': 'Extra High',
+    'x high': 'Extra High',
+    xhigh: 'Extra High',
+    'very high': 'Extra High',
+    '极高': 'Extra High',
+    max: 'Max',
+    '最高': 'Max',
+    '最大': 'Max'
+  });
   const DEFAULT_PREFERENCE = Object.freeze({
     modelKey: DEFAULT_MODEL_KEY,
     modelLabel: DEFAULT_MODEL_LABEL,
@@ -38,6 +59,15 @@
   const normalizedKey = value => normalize(value).toLocaleLowerCase();
   const validIndexRange = (min, max) => Number.isInteger(min) && Number.isInteger(max) && min >= 0 && max >= min && max - min <= 9;
   const panelModelLabel = value => /^GPT-5\.6\s+Sol$/i.test(normalize(value)) ? 'GPT-5.6' : normalize(value);
+
+  function resolveCurrentModelPreference(catalog, saved, buttonText) {
+    const text = normalizedKey(buttonText);
+    const candidates = (catalog || []).map(item => {
+      const fragment = normalizedKey(panelModelLabel(item.label).replace(/^gpt-/i, ''));
+      return fragment && text.includes(fragment) ? { item, length: fragment.length } : null;
+    }).filter(Boolean).sort((a, b) => b.length - a.length);
+    return candidates[0]?.item || createModelOption({ key: saved?.modelKey, label: saved?.modelLabel });
+  }
 
   function normalizePanelSettings(value) {
     const defaults = { collapsed: true, position: null };
@@ -67,7 +97,7 @@
     };
   }
 
-  function preferredPanelPosition(viewport, panel, editorRect, voiceRect, gap = 12) {
+  function preferredExpandedPanelPosition(viewport, panel, editorRect, voiceRect, gap = 12) {
     let right = gap;
     let bottom = gap;
     if (editorRect && editorRect.top > 0 && editorRect.top < viewport.height) {
@@ -82,16 +112,252 @@
     return clampPanelPosition({ right, bottom }, viewport, panel);
   }
 
+  function preferredPanelPosition(viewport, panel, editorRect, voiceRect, gap = 12) {
+    let right = gap;
+    let bottom = gap;
+    // 折叠态默认停在输入栏右侧的留白处；只有视口太窄放不下时，才贴到录音按钮右边。
+    // 这样不会把面板抬到输入框上方，也不会遮住录音按钮。
+    if (voiceRect && Number.isFinite(voiceRect.right) &&
+        viewport.width - gap - panel.width < voiceRect.right + gap) {
+      right = Math.max(0, viewport.width - voiceRect.right - gap - panel.width);
+    }
+    return clampPanelPosition({ right, bottom }, viewport, panel);
+  }
+
   function panelSummary(wanted, current) {
     const describe = preference => {
       if (!preference) return '未设置';
       const modelLabel = panelModelLabel(preference.modelLabel);
       if (preference.effortState === 'none') return modelLabel + ' · 无强度';
-      if (preference.effortState === 'unknown') return modelLabel + ' · 档位未识别';
+      if (preference.effortState === 'unknown') {
+        return modelLabel + ' · ' + (canonicalEffortLabel(preference.observedEffortLabel) || '档位未识别');
+      }
       return modelLabel + ' · ' + preference.effortLabel;
     };
     // 折叠态只显示网页当前已核对的组合，不把目标偏好或等待状态冒充成页面事实。
     return { text: current ? describe(current) : '', state: '' };
+  }
+
+  const PANEL_MODEL_SLOTS = Object.freeze([
+    { key: 'gpt-5.6', label: 'GPT-5.6' },
+    { key: 'gpt-6', label: 'GPT-6' }
+  ]);
+  const PANEL_EFFORT_SLOTS = Object.freeze([
+    { key: 'low', label: 'Low', canonical: 'Low' },
+    { key: 'medium', label: 'Mid', canonical: 'Medium' },
+    { key: 'high', label: 'High', canonical: 'High' },
+    { key: 'extra-high', label: 'X High', canonical: 'Extra High' },
+    { key: 'pro', label: 'Pro', canonical: 'Pro' }
+  ]);
+
+  function panelModelSlot(value) {
+    const key = normalizedKey(panelModelLabel(value));
+    return PANEL_MODEL_SLOTS.find(slot => normalizedKey(slot.label) === key) || null;
+  }
+
+  function panelEffortSlot(value) {
+    const label = canonicalEffortLabel(value);
+    return PANEL_EFFORT_SLOTS.find(slot => normalizedKey(slot.canonical) === normalizedKey(label)) || null;
+  }
+
+  function shouldPreventPanelMouseFocus(event, control) {
+    return Boolean(control && event?.type === 'pointerdown' && event.button === 0 &&
+      event.cancelable && typeof event.preventDefault === 'function');
+  }
+
+  function modelCatalogSignature(items) {
+    return (items || []).map(item => [
+      item.key, item.label, item.category, item.checked, item.disabled, item.reason, item.availability?.state
+    ].join(':')).join('|');
+  }
+
+  function readVisibleModelCatalog(menus, modelInfo, isVisible) {
+    if (!Array.isArray(menus) || !menus.length) return [];
+    const elements = menus.flatMap(menu => [...menu.querySelectorAll('[role="menuitemradio"]')]).filter(isVisible);
+    const items = elements.map(modelInfo).filter(item => item.label && item.key);
+    return items.some(item => panelModelSlot(item.label)) ? items : [];
+  }
+
+  function createModelEffortControls(doc, onModelSelect, onEffortSelect) {
+    const root = doc.createElement('div');
+    root.className = 'model-controls';
+    const modelGroup = doc.createElement('div');
+    modelGroup.className = 'model-buttons';
+    modelGroup.setAttribute('role', 'group');
+    modelGroup.setAttribute('aria-label', '选择模型');
+    const modelNotice = doc.createElement('p');
+    modelNotice.className = 'model-note';
+    modelNotice.id = 'chatgpt-model-availability';
+    modelNotice.setAttribute('role', 'status');
+    modelNotice.setAttribute('aria-live', 'polite');
+    modelNotice.hidden = true;
+    const effortGroup = doc.createElement('div');
+    effortGroup.className = 'effort-buttons';
+    effortGroup.setAttribute('role', 'group');
+    effortGroup.setAttribute('aria-label', '选择思考强度');
+    const effortNotice = doc.createElement('p');
+    effortNotice.className = 'effort-note';
+    effortNotice.id = 'chatgpt-effort-availability';
+    effortNotice.setAttribute('role', 'status');
+    effortNotice.setAttribute('aria-live', 'polite');
+    effortNotice.hidden = true;
+    const modelButtons = new Map();
+    const effortButtons = new Map();
+    let modelBySlot = new Map();
+    let effortBySlot = new Map();
+
+    for (const slot of PANEL_MODEL_SLOTS) {
+      const button = doc.createElement('button');
+      button.className = 'model-choice';
+      button.type = 'button';
+      button.textContent = slot.label;
+      button.setAttribute('aria-pressed', 'false');
+      button.setAttribute('aria-describedby', modelNotice.id);
+      button.dataset.chatgptPanelControl = '';
+      button.dataset.chatgptPreserveFocus = '';
+      button.addEventListener('click', event => {
+        const model = modelBySlot.get(slot.key);
+        if (event.isTrusted && model && !button.disabled) onModelSelect(model);
+      });
+      modelGroup.append(button);
+      modelButtons.set(slot.key, button);
+    }
+
+    for (const slot of PANEL_EFFORT_SLOTS) {
+      const button = doc.createElement('button');
+      button.className = 'effort-choice';
+      button.type = 'button';
+      button.textContent = slot.label;
+      button.setAttribute('aria-pressed', 'false');
+      button.setAttribute('aria-describedby', effortNotice.id);
+      button.dataset.chatgptPanelControl = '';
+      button.dataset.chatgptPreserveFocus = '';
+      button.addEventListener('click', event => {
+        const selection = effortBySlot.get(slot.key);
+        if (event.isTrusted && selection && !button.disabled) {
+          onEffortSelect(selection.model, selection.option.key);
+        }
+      });
+      effortGroup.append(button);
+      effortButtons.set(slot.key, button);
+    }
+
+    root.append(modelGroup, modelNotice, effortGroup, effortNotice);
+
+    function update({
+      catalog = [], current = null, effortModelKey = '', effortOptions = [], observedEffortLabel = '',
+      writerAvailable = false, writerReason = '未发现可确认的同源档位接口', pendingChoice = null
+    } = {}) {
+      const byModelSlot = new Map(PANEL_MODEL_SLOTS.map(slot => [slot.key, []]));
+      for (const model of catalog) {
+        const slot = panelModelSlot(model.label);
+        if (slot) byModelSlot.get(slot.key).push(model);
+      }
+      const nextModelBySlot = new Map();
+      const modelMessages = [];
+      const pendingModelChange = Boolean(pendingChoice && pendingChoice.modelKey !== current?.modelKey);
+      for (const slot of PANEL_MODEL_SLOTS) {
+        const matches = byModelSlot.get(slot.key);
+        const currentMatches = current?.modelKey && panelModelSlot(current.modelLabel)?.key === slot.key;
+        const ambiguous = matches.length > 1;
+        let model = matches.length === 1 ? matches[0] : null;
+        if (!model && currentMatches) {
+          model = {
+            key: current.modelKey,
+            label: current.modelLabel,
+            disabled: true,
+            availability: { state: 'unknown', reason: ambiguous ? '模型目录存在重复项' : '模型目录尚未读取' },
+            reason: ambiguous ? '模型目录存在重复项' : '模型目录尚未读取'
+          };
+        }
+        const reason = ambiguous
+          ? '模型目录存在重复项，暂不能安全选择'
+          : !model
+            ? '状态未确认，暂不能选择'
+            : modelAvailabilityLabel(model) || (model.availability?.state === 'unknown' ? '状态未确认，暂不能选择' : '');
+        const selected = Boolean(currentMatches && (!model || model.key === current.modelKey));
+        const button = modelButtons.get(slot.key);
+        button.disabled = !model || ambiguous || model.disabled || model.availability?.state === 'unknown';
+        button.setAttribute('aria-pressed', String(selected));
+        button.setAttribute('aria-label', slot.label + (selected ? '，当前模型' : '') + (reason ? '，' + reason : ''));
+        button.title = reason || slot.label;
+        button.dataset.selected = String(selected);
+        if (model && !button.disabled) nextModelBySlot.set(slot.key, model);
+        if (reason) modelMessages.push(slot.label + '：' + reason);
+      }
+      modelBySlot = nextModelBySlot;
+      modelNotice.textContent = modelMessages.join('；');
+      modelNotice.hidden = modelMessages.length === 0;
+
+      const currentModelSlot = current && panelModelSlot(current.modelLabel);
+      const currentModelKnown = Boolean(current && currentModelSlot &&
+        catalog.some(model => model.key === current.modelKey && !model.disabled && model.availability?.state !== 'unknown'));
+      const currentLabel = canonicalEffortLabel(current?.effortLabel || observedEffortLabel);
+      const currentEffort = panelEffortSlot(currentLabel);
+      const optionBySlot = new Map();
+      for (const slot of PANEL_EFFORT_SLOTS) {
+        const matches = effortOptions.filter(option => panelEffortSlot(option.label)?.key === slot.key);
+        if (matches.length === 1) optionBySlot.set(slot.key, matches[0]);
+      }
+      const pendingEffort = pendingChoice?.effortState === 'value';
+      const modelPending = pendingModelChange;
+      const effortSelectionEnabled = currentModelKnown && current?.effortState !== 'none' &&
+        current?.effortState !== 'unknown' && effortModelKey === current.modelKey && !modelPending && !pendingEffort;
+      const nextEffortBySlot = new Map();
+      let effortMessage = '';
+      if (modelPending) {
+        effortMessage = '等待页面确认模型切换，强度选项暂时停用';
+      } else if (!current) {
+        effortMessage = '等待页面确认当前模型和强度';
+      } else if (current.effortState === 'none') {
+        effortMessage = '当前模型没有强度设置';
+      } else if (current.effortState === 'unknown' && !currentLabel) {
+        effortMessage = '档位未识别，强度选项暂时停用';
+      } else if (!writerAvailable) {
+        effortMessage = '档位修改受阻：' + writerReason;
+      } else if (!effortOptions.length) {
+        effortMessage = '页面尚未确认可用的强度选项';
+      }
+
+      for (const slot of PANEL_EFFORT_SLOTS) {
+        const option = optionBySlot.get(slot.key) || null;
+        const isCurrent = currentEffort?.key === slot.key && current?.modelKey === effortModelKey;
+        const button = effortButtons.get(slot.key);
+        const model = currentModelSlot
+          ? catalog.find(item => item.key === current.modelKey && panelModelSlot(item.label)?.key === currentModelSlot.key)
+          : null;
+        const available = Boolean(effortSelectionEnabled && model && !model.disabled &&
+          model.availability?.state !== 'unknown' && option && writerAvailable);
+        button.disabled = !available;
+        button.setAttribute('aria-pressed', String(Boolean(isCurrent)));
+        let reason = '';
+        if (available) {
+          reason = isCurrent ? '当前档位' : '';
+          nextEffortBySlot.set(slot.key, { model, option });
+        } else if (!option) {
+          reason = isCurrent && current?.effortState === 'unknown'
+            ? '当前名称已识别，但档位值未确认'
+            : '选项未确认：页面未提供此档位的名称和值';
+        } else if (!writerAvailable) {
+          reason = '档位修改受阻：' + writerReason;
+        } else if (modelPending) {
+          reason = '等待页面确认模型切换';
+        } else if (!currentModelKnown) {
+          reason = '当前模型可用状态未确认';
+        }
+        button.setAttribute('aria-label', slot.label + (isCurrent ? '，当前档位' : '') + (reason ? '，' + reason : ''));
+        button.title = reason || slot.label;
+        button.dataset.selected = String(Boolean(isCurrent));
+      }
+      effortBySlot = nextEffortBySlot;
+      if (!effortMessage && effortOptions.length < PANEL_EFFORT_SLOTS.length) {
+        effortMessage = '未读取到的强度选项保持停用';
+      }
+      effortNotice.textContent = effortMessage;
+      effortNotice.hidden = !effortMessage;
+    }
+
+    return { element: root, modelButtons, effortButtons, modelNotice, effortNotice, update };
   }
 
   function resolveConversationPreference(saved, pending, conversation) {
@@ -123,8 +389,124 @@
     return match ? Number(match[1] || match[2]) : null;
   }
 
+  function canonicalEffortLabel(value) {
+    const text = normalize(value);
+    if (!text || /^原生第\s*\d+\s*档$/i.test(text)) return '';
+    const key = text.toLocaleLowerCase().replace(/\s+/g, ' ');
+    return EFFORT_LABEL_ALIASES[key] || text;
+  }
+
+  function effortLabelFromText(value) {
+    const text = normalize(value);
+    if (!text) return '';
+    const labels = '(?:extra\\s*high|very\\s*high|x\\s*high|medium|med|mid|high|low|instant|xhigh|max|即时|低|中等|中|高|极高|最高|最大)';
+    const match = text.match(new RegExp('(?:^|[\\s·•,，:：|/])(' + labels + ')(?=$|[\\s·•,，:：|/])', 'i'));
+    if (match) return canonicalEffortLabel(match[1]);
+    return canonicalEffortLabel(effortLabelFromStatus(text));
+  }
+
+  function observeEffortPreference(saved, pageText, current) {
+    const base = normalizePreference(saved);
+    if (!base) return null;
+    const value = Number.isInteger(current?.value) ? current.value : null;
+    const min = Number.isInteger(current?.min) ? current.min : null;
+    const itemIndex = Number.isInteger(current?.itemIndex) ? current.itemIndex : effortItemIndexFromStatus(pageText);
+    const expectedItem = value !== null && min !== null ? value - min + 1 : null;
+    const itemMatches = itemIndex === null || expectedItem === null || itemIndex === expectedItem;
+    const label = itemMatches && (
+      effortLabelFromText(pageText) || canonicalEffortLabel(current?.accessibleLabel || current?.label)
+    );
+    if (!label) return {
+      ...base,
+      effortKey: null,
+      effortLabel: '',
+      effortState: 'unknown',
+      observedEffortLabel: ''
+    };
+    if (value === null || min === null) {
+      // 折叠态可能只有模型按钮的可读文案，没有展开的滑杆数值。
+      // 只有文案与已保存的真实标签一致时，才复用旧的数值键；否则保持未识别。
+      const legacyOrdinal = /^原生第\s*\d+\s*档$/i.test(normalize(base.effortLabel));
+      if (base.effortState !== 'value' || (!legacyOrdinal && effortKey(base.effortLabel) !== effortKey(label))) {
+        return {
+          ...base,
+          effortKey: null,
+          effortLabel: '',
+          effortState: 'unknown',
+          observedEffortLabel: label
+        };
+      }
+      return { ...base, effortLabel: label, effortState: 'value', observedEffortLabel: label };
+    }
+    return {
+      ...base,
+      effortKey: effortValueKey(base.modelKey, value),
+      effortLabel: label,
+      effortState: 'value',
+      observedEffortLabel: label
+    };
+  }
+
+  function createEffortBackendAdapter(implementation) {
+    const reason = '未发现可确认的同源档位接口';
+    const canRead = !!implementation && typeof implementation.read === 'function';
+    const canWrite = !!implementation && typeof implementation.write === 'function';
+    const invoke = async (method, payload, options) => {
+      if (!implementation || typeof implementation[method] !== 'function') {
+        return { ok: false, reason };
+      }
+      try {
+        const result = await implementation[method](payload, options);
+        if (!result || typeof result.ok !== 'boolean') return { ok: false, reason: '后端响应无法确认' };
+        return result;
+      } catch (error) {
+        return { ok: false, reason: normalize(error?.message) || '后端请求失败' };
+      }
+    };
+    return Object.freeze({
+      available: canWrite,
+      canRead,
+      canWrite,
+      reason: canWrite ? '' : reason,
+      read: (payload, options) => invoke('read', payload, options),
+      write: (payload, options) => invoke('write', payload, options)
+    });
+  }
+
+  function preferenceMatches(actual, target) {
+    return actual && target && actual.modelKey === target.modelKey &&
+      actual.effortState === target.effortState &&
+      (target.effortState !== 'value' || actual.effortKey === target.effortKey);
+  }
+
+  async function confirmEffortWrite({
+    adapter, payload, target, readCurrent, check, wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
+    now = () => Date.now(), timeoutMs = 5000, signal
+  }) {
+    if (!adapter?.available) return { ok: false, reason: adapter?.reason || '未发现可确认的同源档位接口' };
+    check();
+    if (signal?.aborted) return { ok: false, reason: '档位修改已取消' };
+    const written = await adapter.write(payload, { signal });
+    if (signal?.aborted) return { ok: false, reason: '档位修改已取消' };
+    if (!written?.ok) return { ok: false, reason: written?.reason || '后端请求失败' };
+    const deadline = now() + timeoutMs;
+    let read = null;
+    while (true) {
+      if (signal?.aborted) return { ok: false, reason: '档位修改已取消', read };
+      check();
+      read = await readCurrent();
+      if (signal?.aborted) return { ok: false, reason: '档位修改已取消', read };
+      check();
+      const preference = normalizePreference(read?.preference);
+      if (preferenceMatches(preference, target)) return { ok: true, read, preference };
+      const remaining = deadline - now();
+      if (remaining <= 0) return { ok: false, reason: '页面未在 5 秒内确认切换结果', read };
+      await wait(Math.min(150, remaining));
+    }
+  }
+
   function effortKey(label) {
-    const text = normalizedKey(label);
+    const text = normalizedKey(canonicalEffortLabel(label));
     if (!text) return null;
     if (/^(?:low|instant|none|即时|低|无推理)$/.test(text)) return 'effort:low';
     if (/^(?:med|medium|中|中等)$/.test(text)) return 'effort:medium';
@@ -157,7 +539,13 @@
     if (!validIndexRange(min, max)) return { kind: 'unknown', options: [], reason: '强度范围无法安全识别' };
     const options = [];
     for (let value = min; value <= max; value++) {
-      const label = effortLabelFromStatus(captions && captions[value]) || '原生第 ' + (value - min + 1) + ' 档';
+      const caption = captions && captions[value];
+      const itemIndex = effortItemIndexFromStatus(caption);
+      if (itemIndex !== null && itemIndex !== value - min + 1) {
+        return { kind: 'unknown', options: [], reason: '档位文案与当前值不一致' };
+      }
+      const label = effortLabelFromText(caption);
+      if (!label) return { kind: 'unknown', options: [], reason: '档位名称无法从页面真实状态确认' };
       options.push({ value, key: effortValueKey(modelKey, value), label });
     }
     return { kind: 'value', options, reason: '' };
@@ -167,6 +555,57 @@
     return /已达到使用限额|已达使用限额|已锁定.{0,20}访问权限|usage\s+limit\s+reached|limit\s+reached|locked.{0,40}access\s+options/i.test(normalize(value));
   }
 
+  function classifyModelAvailability(reason, disabled = false) {
+    const text = normalize(reason);
+    const limited = /已达到使用限额|已达使用限额|usage\s+limit\s+reached|limit\s+reached/i.test(text);
+    const permission = /已锁定|访问权限|权限受限|需要权限|access\s+options|permission\s+(?:required|restricted)|locked/i.test(text);
+    if (limited && permission) return { state: 'limited-and-permission', reason: text };
+    if (limited) {
+      return { state: 'limited', reason: text || '已达到使用限额' };
+    }
+    if (permission) {
+      return { state: 'permission', reason: text || '需要访问权限' };
+    }
+    if (disabled || text) return { state: 'restricted', reason: text || '原生控件标记为不可用' };
+    return { state: 'available', reason: '' };
+  }
+
+  function isAvailabilityHint(value) {
+    return /限额|已锁定|访问权限|权限受限|需要权限|不可用|不可访问|已禁用|不支持|usage\s+limit|limit\s+reached|locked|access\s+options|permission|unavailable|not\s+available|disabled|not\s+supported/i.test(normalize(value));
+  }
+
+  function modelAvailabilityLabel(model) {
+    const availability = model?.availability || classifyModelAvailability(model?.reason, model?.disabled);
+    if (availability.state === 'limited' || availability.state === 'permission' ||
+        availability.state === 'limited-and-permission' || availability.state === 'restricted') {
+      return availability.reason || '原生控件标记为不可用';
+    }
+    if (availability.state === 'unknown') return availability.reason || '状态未确认';
+    return '';
+  }
+
+  function effortRowPresentation({ selected, model, observedLabel, options, writerAvailable }) {
+    const label = canonicalEffortLabel(observedLabel);
+    if (model?.disabled) {
+      return { label: modelAvailabilityLabel(model) || '不可用', disabled: true, title: modelAvailabilityLabel(model) || '模型不可用' };
+    }
+    if (selected && label && (!options || options.length === 0)) {
+      const reason = writerAvailable ? '已识别当前档位，其他选项尚未确认' : '档位修改受阻：未发现可确认的同源档位接口';
+      return { label, disabled: true, title: reason };
+    }
+    if (!selected || !options || options.length === 0) {
+      return { label: selected ? '档位未识别' : '选择模型后读取强度', disabled: true, title: '' };
+    }
+    if (!writerAvailable) {
+      return {
+        label: '',
+        disabled: true,
+        title: '档位修改受阻：未发现可确认的同源档位接口'
+      };
+    }
+    return { label: '', disabled: false, title: '' };
+  }
+
   function createModelOption(input) {
     const data = input || {};
     const label = normalize(data.label);
@@ -174,13 +613,16 @@
     const key = normalize(data.key) || (stableId ? 'id:' + normalizedKey(stableId) : label ? 'label:' + normalizedKey(label) : '');
     const category = normalize(data.category || '');
     const reason = normalize(data.reason || '');
+    const availability = data.availability || classifyModelAvailability(reason, Boolean(data.disabled));
+    const blockedAvailability = ['limited', 'permission', 'limited-and-permission', 'restricted'].includes(availability.state);
     return {
       key,
       label,
       category,
       checked: Boolean(data.checked),
-      disabled: Boolean(data.disabled || isLimitHint(reason)),
-      reason: data.disabled && !reason ? '原生控件标记为不可用' : reason
+        disabled: Boolean(data.disabled || blockedAvailability),
+        reason: reason || availability.reason,
+        availability
     };
   }
 
@@ -296,33 +738,70 @@
     if (doc.documentElement.dataset.chatgptModelPreferenceVersion === VERSION) return;
     doc.documentElement.dataset.chatgptModelPreferenceVersion = VERSION;
     const prefs = new Preferences(win.localStorage, win.sessionStorage);
+    const effortBackend = createEffortBackendAdapter();
     const panelStorage = readPanelSettings(win.localStorage);
     let panelSettings = panelStorage.settings, panelStorageAvailable = panelStorage.available;
     let drag = null, positionFrame = 0;
     let positionAnchorObserver = null, positionAnchors = new Set();
     let key = context(win.location.pathname), timer = 0, captureTimer = 0;
-    let serial = 0, lastInput = 0, pointerDown = false, composing = false;
-    let working = false, ownedMenu = false, userOwnsMenu = false;
+    let serial = 0, lastInput = 0, voiceInputUntil = 0, pointerDown = false, composing = false;
+    let working = false, ownedMenu = false, userOwnsMenu = false, activeWriteController = null;
     let pendingChoice = null, pendingNativeCapture = false;
     let conversationPreference = null;
     let verified = '', blocked = '', lastObservedButton = '', statusText = '正在读取原生模型选项';
-    let catalog = [], effortOptions = [], effortModelKey = '', confirmedPreference = null;
+    let catalog = [], catalogReadSignature = '', effortOptions = [], effortModelKey = '', effortObservedLabel = '', confirmedPreference = null;
     let panelUi = null, pendingSend = null;
 
     const visible = element => !!element && element.isConnected && element.getClientRects().length > 0 &&
       win.getComputedStyle(element).visibility !== 'hidden' && win.getComputedStyle(element).display !== 'none';
-    const picker = () => [...doc.querySelectorAll(PICKER)].find(visible);
+    const picker = () => {
+      const exact = [...doc.querySelectorAll(PICKER)].find(visible);
+      if (exact) return exact;
+      return [...doc.querySelectorAll('button,[role="button"]')].find(element => {
+        if (!visible(element) || element.closest?.('[data-chatgpt-model-panel],[role="menu"]')) return false;
+        const accessible = normalize(element.getAttribute('aria-label'));
+        const text = normalize(element.textContent);
+        return /(?:模型|model)/i.test(accessible) || /(?:GPT-\d|\b5\.6\b|\b(?:Low|Medium|High|Max)\b|低|中|高|极高|最高)/i.test(text);
+      });
+    };
+    const readNativeModelText = element => {
+      const values = [];
+      const add = value => {
+        const text = normalize(value);
+        if (!text || text.length > 240 || values.includes(text)) return;
+        if (effortLabelFromText(text) || /GPT-\d|\b5\.6\b/i.test(text)) values.push(text);
+      };
+      if (!element) return '';
+      add(element.getAttribute('aria-label'));
+      add(element.getAttribute('aria-valuetext'));
+      add(element.getAttribute('title'));
+      add(element.innerText || element.textContent);
+      for (const attribute of ['aria-labelledby', 'aria-describedby']) {
+        for (const id of normalize(element.getAttribute(attribute)).split(/\s+/).filter(Boolean)) {
+          add(doc.getElementById(id)?.innerText || doc.getElementById(id)?.textContent);
+        }
+      }
+      return values.join(' · ');
+    };
     const menus = () => [...doc.querySelectorAll('[role="menu"]')].filter(visible);
     const slider = () => menus().map(menu => menu.querySelector('[role="slider"]')).find(visible) || null;
     const stopButton = () => [...doc.querySelectorAll('button[data-testid="stop-button"],button[aria-label="Stop streaming"],button[aria-label="Stop generating"],button[aria-label="停止生成"],button[aria-label="停止流式传输"]')].find(visible);
     const voiceButton = () => {
       const buttons = [...doc.querySelectorAll('button')].filter(visible);
-      const matches = buttons.filter(element => /^(?:听写|Dictate|开始语音|Start voice|录音|Record)$/i.test(
+      const matches = buttons.filter(element => /(?:听写|dictate|开始语音|start voice|录音|record|停止录音|stop recording|停止听写|stop dictation)/i.test(
         normalize(element.getAttribute('aria-label') || element.textContent)
       ));
       return matches.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0] || null;
     };
     const composer = () => [...doc.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);
+    const voiceBusy = () => {
+      if (Date.now() < voiceInputUntil) return true;
+      const button = voiceButton();
+      if (!button) return false;
+      const state = normalize(button.getAttribute('aria-pressed') || button.getAttribute('data-state'));
+      const label = normalize(button.getAttribute('aria-label') || button.textContent);
+      return state === 'true' || /^(?:on|open|active)$/i.test(state) || /(?:停止|结束|stop|end)/i.test(label);
+    };
     const delay = ms => new Promise(resolve => win.setTimeout(resolve, ms));
     const currentPath = () => win.location.pathname;
     const selectedIn = options => options.find(option => option.checked) || null;
@@ -340,9 +819,17 @@
     function modelUnavailableReason(element) {
       const directDisabled = element.matches(':disabled,[aria-disabled="true"],[data-disabled="true"]') ||
         element.getAttribute('data-state') === 'disabled';
-      if (directDisabled) return normalize(element.getAttribute('aria-description') || element.getAttribute('title')) || '原生控件标记为不可用';
+      const described = normalize(element.getAttribute('aria-describedby')).split(/\s+/).filter(Boolean)
+        .map(id => normalize(doc.getElementById(id)?.textContent))
+        .filter(isAvailabilityHint);
+      const accessibleDescription = normalize(element.getAttribute('aria-description'));
+      const directReason = [
+        directDisabled || isAvailabilityHint(accessibleDescription) ? accessibleDescription : '',
+        ...described,
+        directDisabled ? normalize(element.getAttribute('title')) : ''
+      ].filter(Boolean).join(' · ');
       const parent = element.parentElement;
-      if (!parent) return '';
+      if (!parent) return directReason || (directDisabled ? '原生控件标记为不可用' : '');
       const siblings = [...parent.children];
       const index = siblings.indexOf(element);
       const hints = [];
@@ -351,11 +838,12 @@
         if (sibling.matches('[role="menuitemradio"]')) break;
         if (sibling.matches('.sr-only,[role="status"],[aria-live]')) {
           const text = normalize(sibling.textContent);
-          if (text) hints.unshift(text);
+          if (isAvailabilityHint(text)) hints.unshift(text);
         }
       }
-      const reason = hints.join(' ');
-      return isLimitHint(reason) ? reason : '';
+      const reason = normalize([directReason, ...hints].filter(Boolean).join(' · '));
+      const availability = classifyModelAvailability(reason, directDisabled);
+      return availability.state === 'available' ? '' : availability.reason;
     }
 
     function modelCategory(element) {
@@ -384,13 +872,26 @@
         stableId,
         category: modelCategory(element),
         checked: element.getAttribute('aria-checked') === 'true' || element.getAttribute('data-state') === 'checked',
-        disabled: !!reason,
+        disabled: element.matches(':disabled,[aria-disabled="true"],[data-disabled="true"]') ||
+          element.getAttribute('data-state') === 'disabled' || !!reason,
         reason
       });
     }
 
     function modelElements() {
       return menus().flatMap(menu => [...menu.querySelectorAll('[role="menuitemradio"]')].filter(visible));
+    }
+
+    function observeVisibleModelCatalog() {
+      if (working || ownedMenu || !menus().length) return false;
+      const items = readVisibleModelCatalog(menus(), modelInfo, visible);
+      if (!items.length) return false;
+      const signature = modelCatalogSignature(items);
+      if (signature === catalogReadSignature) return false;
+      catalogReadSignature = signature;
+      catalog = items;
+      renderPanel();
+      return true;
     }
 
     function isChooser(element) {
@@ -404,7 +905,7 @@
     }
 
     function isBusy() {
-      return doc.readyState !== 'complete' || doc.hidden || pointerDown || composing ||
+      return doc.readyState !== 'complete' || doc.hidden || pointerDown || composing || voiceBusy() ||
         Date.now() - lastInput < 1300 || !!stopButton() ||
         (menus().length > 0 && !ownedMenu);
     }
@@ -467,6 +968,7 @@
       for (const item of items) counts.set(item.key, (counts.get(item.key) || 0) + 1);
       if ([...counts.values()].some(count => count > 1)) throw new Error('模型列表存在重复标识，未猜测目标模型');
       catalog = items;
+      catalogReadSignature = modelCatalogSignature(items);
       renderPanel();
       return { items, elements, selected: selectedIn(items) };
     }
@@ -510,45 +1012,7 @@
       };
     }
 
-    async function waitForEffortCaption(state, previousStatus, previousLabel, fallback, check) {
-      let current = state;
-      for (let i = 0; i < 12; i++) {
-        check();
-        const expectedItem = current.state === 'range' ? current.value - current.min + 1 : null;
-        const itemMatches = current.itemIndex === null || current.itemIndex === expectedItem;
-        const accessibleChanged = current.accessibleLabel && current.accessibleLabel !== previousLabel;
-        if (accessibleChanged) return current.accessibleLabel;
-        if (current.label && itemMatches && ((!previousStatus && !previousLabel) || current.statusText !== previousStatus || current.label !== previousLabel)) {
-          return current.label;
-        }
-        await delay(45);
-        current = currentEffort();
-      }
-      return fallback || '';
-    }
-
-    async function moveSliderTo(target, check) {
-      let state = currentEffort();
-      if (state.state !== 'range') throw new Error('强度滑杆范围无法确认');
-      if (!Number.isInteger(target) || target < state.min || target > state.max) throw new Error('目标档位超出原生范围');
-      let attempts = 0;
-      while (state.value !== target && attempts++ < 10) {
-        check();
-        const before = state.value;
-        state.control.focus({ preventScroll: true });
-        const keyName = before < target ? 'ArrowRight' : 'ArrowLeft';
-        state.control.dispatchEvent(new win.KeyboardEvent('keydown', { key: keyName, code: keyName, bubbles: true, cancelable: true }));
-        await waitFor(() => {
-          const next = currentEffort();
-          return next.state === 'range' && next.value !== before ? next : null;
-        }, check, '强度档位没有变化');
-        state = currentEffort();
-      }
-      if (state.value !== target) throw new Error('无法定位目标档位');
-      return state;
-    }
-
-    async function discoverEfforts(check, modelKey) {
+    function discoverEfforts(modelKey) {
       const initial = currentEffort();
       if (initial.state === 'missing') {
         if (noEffortIsExplicit(menus()[0])) return { kind: 'none', options: [], current: null };
@@ -557,103 +1021,68 @@
       if (initial.state !== 'range' || initial.max - initial.min > 9) {
         return { kind: 'unknown', options: [], current: null, reason: '强度范围无法安全识别' };
       }
-      const captions = Object.create(null);
-      let originalValue = initial.value;
-      const initialItem = initial.value - initial.min + 1;
-      const initialLabel = (initial.accessibleLabel || initial.itemIndex === null || initial.itemIndex === initialItem) ? initial.label : '';
-      captions[initial.value] = initialLabel || '';
-      let previousStatus = initial.statusText;
-      let previousLabel = initialLabel || '';
-      let interrupted = false;
-      let probeFailed = false;
-      try {
-        let current = initial.value;
-        while (current > initial.min) {
-          const next = await moveSliderTo(current - 1, check);
-          current = next.value;
-          captions[current] = await waitForEffortCaption(next, previousStatus, previousLabel, '', check);
-          const observed = currentEffort();
-          previousStatus = observed.statusText || previousStatus;
-          previousLabel = observed.label || previousLabel;
-        }
-        while (current < initial.max) {
-          const next = await moveSliderTo(current + 1, check);
-          current = next.value;
-          captions[current] = await waitForEffortCaption(next, previousStatus, previousLabel, '', check);
-          const observed = currentEffort();
-          previousStatus = observed.statusText || previousStatus;
-          previousLabel = observed.label || previousLabel;
-        }
-      } catch (error) {
-        try { check(); } catch (_) { interrupted = true; }
-        if (interrupted) throw error;
-        probeFailed = true;
-      } finally {
-        if (!interrupted) {
-          const now = currentEffort();
-          if (now.state === 'range' && now.value !== originalValue) {
-            try { await moveSliderTo(originalValue, check); } catch (error) {
-              try { check(); } catch (_) { interrupted = true; }
-              if (!interrupted) throw error;
-            }
-          }
-        }
-      }
-      if (interrupted) return { kind: 'unknown', options: [], current: null, reason: '探测期间用户开始操作' };
-      const map = buildEffortOptions(modelKey, initial.min, initial.max, captions);
-      if (map.kind !== 'value') return { kind: 'unknown', options: [], current: null, reason: map.reason };
-      const current = map.options.find(option => option.value === originalValue) || null;
+      const label = canonicalEffortLabel(initial.accessibleLabel || initial.label);
+      if (!label) return { kind: 'unknown', options: [], current: null, reason: '档位名称无法从当前页面状态确认' };
+      const current = { value: initial.value, key: effortValueKey(modelKey, initial.value), label };
       return {
         kind: 'value',
-        options: map.options,
+        options: [current],
         current,
-        reason: probeFailed ? '部分档位名称不可读取，面板会按原生档位序号显示' : ''
+        reason: ''
       };
     }
 
-    async function readCurrentPreferenceFromNative(check, nativeModelChange = false) {
-      const modelState = await openModelOptions(check);
-      const selected = modelState.selected;
-      if (!selected) throw new Error('当前模型没有唯一的原生勾选项');
-      if (selected.disabled) return { unavailable: true, model: selected, reason: selected.reason || '当前模型不可用' };
-      await closeOwnedMenus();
-      await openParentMenu(check);
-      const effortState = await discoverEfforts(check, selected.key);
-      if (effortState.kind === 'none') {
-        return {
-          unavailable: false,
-          preference: { modelKey: selected.key, modelLabel: selected.label, effortKey: null, effortLabel: '', effortState: 'none' },
-          effortState
-        };
-      }
-      if (effortState.kind === 'unknown') {
-        return {
-          unavailable: false,
-          preference: { modelKey: selected.key, modelLabel: selected.label, effortKey: null, effortLabel: '', effortState: 'unknown' },
-          effortState
-        };
-      }
-      const current = effortState.current;
+    function currentModelPreference(saved, buttonText) {
+      return resolveCurrentModelPreference(catalog, saved, buttonText);
+    }
+
+    function readCurrentPreferenceFromNative(check) {
+      if (check) check();
+      const button = picker();
+      if (!button) throw new Error('找不到可读取的原生模型控件');
+      const saved = prefs.ensure(key);
+      const buttonText = readNativeModelText(button);
+      const model = currentModelPreference(saved, buttonText);
+      const current = currentEffort();
+      const statusText = current.menu ? readEffortStatus(current.menu).raw : current.statusText;
+      const observationText = [current.accessibleLabel, statusText, buttonText].filter(Boolean).join(' · ');
+      const preference = observeEffortPreference(
+        { ...saved, modelKey: model.key, modelLabel: model.label },
+        observationText,
+        current
+      );
+      if (!preference) throw new Error('当前页面偏好无法识别');
+      const effortState = preference.effortState === 'value'
+        ? { kind: 'value', options: current.value === null ? [] : [{ value: current.value, key: preference.effortKey, label: preference.effortLabel }], current: current.value === null ? null : { value: current.value, key: preference.effortKey, label: preference.effortLabel } }
+        : { kind: preference.effortState === 'none' ? 'none' : 'unknown', options: [], current: null, reason: '档位名称无法从当前页面状态确认' };
+      if (check) check();
       return {
         unavailable: false,
-        preference: {
-          modelKey: selected.key,
-          modelLabel: selected.label,
-          effortKey: current.key,
-          effortLabel: current.label,
-          effortState: 'value'
+        preference,
+        observedEffortLabel: preference.observedEffortLabel || '',
+        observation: {
+          context: key,
+          modelKey: model.key,
+          modelLabel: model.label,
+          effortValue: Number.isInteger(current.value) ? current.value : null,
+          effortLabel: preference.observedEffortLabel || '',
+          state: preference.observedEffortLabel ? 'label-observed' : 'unknown',
+          source: current.accessibleLabel ? 'aria-valuetext' : current.menu ? 'menu-status' : 'model-control-text'
         },
-        effortState
+        effortState,
+        current
       };
     }
 
-    function updateEffortUi(modelKey, result) {
+    function updateEffortUi(modelKey, result, observedLabel = '') {
       effortModelKey = modelKey;
       effortOptions = result.kind === 'value' ? result.options : [];
+      effortObservedLabel = canonicalEffortLabel(observedLabel);
       renderPanel();
     }
 
     async function readCatalogOnly(check) {
+      // 仅读取模型列表供展开态使用，不读取或探测档位。
       const state = await openModelOptions(check);
       await closeOwnedMenus();
       return state;
@@ -676,17 +1105,8 @@
       return resolveConversationPreference(prefs.ensure(key), pendingChoice, savedConversationPreference());
     }
 
-    function appendEffortOption(select, label, value = '', disabled = true) {
-      const option = doc.createElement('option');
-      option.textContent = label;
-      option.value = value;
-      option.disabled = disabled;
-      option.selected = disabled;
-      select.append(option);
-    }
-
     function chooseModel(item) {
-      if (!item || item.disabled) return;
+      if (!item || item.disabled || item.availability?.state === 'unknown') return;
       route();
       pendingChoice = { modelKey: item.key, modelLabel: item.label, effortKey: null, effortLabel: '', effortState: 'unknown' };
       rememberConversationPreference(pendingChoice);
@@ -696,6 +1116,11 @@
     }
 
     function chooseEffort(item, value) {
+      if (!effortBackend.available) {
+        blocked = 'backend-unavailable';
+        status('档位修改受阻：' + effortBackend.reason);
+        return;
+      }
       const selected = item && !item.disabled ? item : null;
       const chosenEffort = effortOptions.find(option => option.key === value);
       if (!selected || !chosenEffort || effortModelKey !== selected.key) {
@@ -710,96 +1135,30 @@
         effortLabel: chosenEffort.label,
         effortState: 'value'
       };
-      rememberConversationPreference(pendingChoice);
       verified = ''; blocked = '';
       status('等待空闲后应用所选档位');
       schedule(1500);
     }
 
-    function renderModelRows(wanted, resolved) {
-      const models = catalog.map(item => ({ ...item }));
-      if (!models.some(item => item.key === wanted.modelKey || normalizedKey(item.label) === normalizedKey(wanted.modelLabel))) {
-        models.unshift(createModelOption({ label: wanted.modelLabel, key: wanted.modelKey, disabled: true, reason: '当前原生菜单没有此模型' }));
-      }
-      const selectedKey = resolved ? resolved.key : wanted.modelKey;
-      const catalogKey = models.map(item => [item.key, item.label, item.category, item.disabled, item.reason].join(':')).join('|');
-      if (panelUi.catalogKey !== catalogKey) {
-        panelUi.modelList.replaceChildren();
-        panelUi.modelRows = new Map();
-        for (const item of models) {
-          const row = doc.createElement('div');
-          row.className = 'model-row';
-          row.dataset.modelKey = item.key;
-          const modelButton = doc.createElement('button');
-          modelButton.className = 'model-choice';
-          modelButton.type = 'button';
-          modelButton.textContent = panelModelLabel(item.label);
-          modelButton.title = item.reason || item.label;
-          modelButton.disabled = item.disabled;
-          modelButton.dataset.chatgptPanelControl = '';
-          modelButton.addEventListener('click', event => {
-            if (!event.isTrusted) return;
-            chooseModel(item);
-          });
-          const effort = doc.createElement('select');
-          effort.className = 'effort-choice';
-          effort.setAttribute('aria-label', item.label + ' 强度');
-          effort.dataset.chatgptPanelControl = '';
-          effort.addEventListener('change', event => {
-            if (!event.isTrusted) return;
-            chooseEffort(item, effort.value);
-          });
-          row.append(modelButton, effort);
-          panelUi.modelList.append(row);
-          panelUi.modelRows.set(item.key, { item, row, modelButton, effort });
-        }
-        panelUi.catalogKey = catalogKey;
-      }
-      for (const { item, row, modelButton, effort } of panelUi.modelRows.values()) {
-        const isSelected = item.key === selectedKey;
-        row.dataset.selected = String(isSelected);
-        row.setAttribute('aria-disabled', String(item.disabled));
-        modelButton.setAttribute('aria-pressed', String(isSelected));
-        effort.replaceChildren();
-        const canReadEffort = isSelected && !item.disabled && wanted.effortState !== 'unknown' &&
-          effortModelKey === item.key && effortOptions.length > 0;
-        if (item.disabled) {
-          appendEffortOption(effort, '不可用');
-          effort.disabled = true;
-        } else if (isSelected && wanted.effortState === 'none') {
-          appendEffortOption(effort, '无强度设置');
-          effort.disabled = true;
-        } else if (!canReadEffort) {
-          appendEffortOption(effort, '选择模型后读取强度');
-          effort.disabled = true;
-        } else {
-          for (const option of effortOptions) {
-            const effortOption = doc.createElement('option');
-            effortOption.value = option.key;
-            effortOption.textContent = option.label;
-            effort.append(effortOption);
-          }
-          effort.disabled = false;
-          if (wanted.effortKey && effortOptions.some(option => option.key === wanted.effortKey)) {
-            effort.value = wanted.effortKey;
-          }
-        }
-      }
-    }
-
     function renderPanel() {
       if (!panelUi) return;
-      const saved = desiredConversationPreference();
-      const wanted = pendingChoice || saved;
-      const resolved = findModel(catalog, wanted);
-      renderModelRows(wanted, resolved);
       const current = confirmedPreference;
       panelUi.status.textContent = statusText;
-      panelUi.saveDefault.disabled = !current || current.effortState === 'unknown' || !!blocked || statusText !== '已确认';
-      const short = panelSummary(wanted, current);
-      panelUi.short.textContent = short.text || '…';
+      panelUi.controls.update({
+        catalog,
+        current,
+        effortModelKey,
+        effortOptions,
+        observedEffortLabel: effortObservedLabel,
+        writerAvailable: effortBackend.available,
+        writerReason: effortBackend.reason,
+        pendingChoice
+      });
+      const short = panelSummary(current, current);
+      const summaryText = short.text || (panelSettings.collapsed ? '…' : '状态未确认');
+      panelUi.short.textContent = summaryText;
       panelUi.short.title = short.text;
-      panelUi.short.setAttribute('aria-label', short.text);
+      panelUi.short.setAttribute('aria-label', short.text || summaryText);
       panelUi.storageNote.hidden = panelStorageAvailable;
     }
 
@@ -821,12 +1180,9 @@
       if (!requested) {
         const editor = composer();
         const voice = voiceButton();
-        requested = preferredPanelPosition(
-          viewport,
-          panel,
-          editor?.getBoundingClientRect(),
-          voice?.getBoundingClientRect()
-        );
+        requested = panelSettings.collapsed
+          ? preferredPanelPosition(viewport, panel, editor?.getBoundingClientRect(), voice?.getBoundingClientRect())
+          : preferredExpandedPanelPosition(viewport, panel, editor?.getBoundingClientRect(), voice?.getBoundingClientRect());
       }
       const actual = clampPanelPosition(requested, viewport, panel);
       panelUi.host.style.right = actual.right + 'px';
@@ -871,6 +1227,7 @@
     function setPanelCollapsed(collapsed) {
       if (collapsed && panelUi.body.contains(panelUi.shadow.activeElement)) panelUi.toggle.focus({ preventScroll: true });
       panelSettings.collapsed = collapsed;
+      panelUi.host.dataset.collapsed = String(collapsed);
       panelUi.body.hidden = collapsed;
       panelUi.toggle.textContent = collapsed ? '▴' : '▾';
       panelUi.toggle.setAttribute('aria-label', collapsed ? '展开模型与档位面板' : '折叠模型与档位面板');
@@ -886,11 +1243,6 @@
       toggle.setAttribute('aria-label', panelSettings.collapsed ? '展开模型与档位面板' : '折叠模型与档位面板');
       toggle.setAttribute('aria-expanded', String(!panelSettings.collapsed));
       toggle.addEventListener('click', () => setPanelCollapsed(!panelSettings.collapsed));
-      panelUi.resetPosition.addEventListener('click', () => {
-        panelSettings.position = null;
-        savePanelSettings();
-        applyPanelPosition();
-      });
       panel.addEventListener('pointerdown', event => {
         if (event.button !== 0 || drag) return;
         const path = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
@@ -958,35 +1310,33 @@
       }
       const host = doc.createElement('div');
       host.dataset.chatgptModelPanel = VERSION;
+      host.dataset.collapsed = String(panelSettings.collapsed);
       const shadow = host.attachShadow({ mode: 'open' });
       const style = doc.createElement('style');
       style.textContent = `
-        :host { all: initial; position: fixed; right: 12px; bottom: 112px; z-index: 2147483647; display: block; width: min(198px, calc(100vw - 16px)); color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        :host { all: initial; position: fixed; right: 12px; bottom: 12px; z-index: 2147483647; display: block; width: min(198px, calc(100vw - 16px)); color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        :host([data-collapsed="true"]) { width: max-content; max-width: min(148px, calc(100vw - 16px)); }
         * { box-sizing: border-box; }
         .panel { width: 100%; border: 1px solid rgba(255,255,255,.14); border-radius: 13px; background: rgba(25,28,34,.96); color: #f4f5f7; box-shadow: 0 8px 26px rgba(0,0,0,.28); backdrop-filter: blur(16px); cursor: grab; touch-action: manipulation; }
         .panel.is-dragging { cursor: grabbing; user-select: none; touch-action: none; }
-        .header { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 36px; padding: 3px 5px 3px 11px; border-radius: 12px 12px 0 0; }
-        .short { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #f5f7fb; font-size: 12px; font-weight: 600; letter-spacing: .01em; }
-        .toggle { flex: none; width: 30px; height: 30px; min-height: 30px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: #c9d5e4; font-size: 17px; font-weight: 700; line-height: 1; }
+        .header { display: flex; align-items: center; gap: 0; min-width: 0; min-height: 32px; padding: 2px 4px 2px 8px; border-radius: 12px 12px 0 0; }
+        .short { flex: 0 1 auto; min-width: 0; max-width: calc(100vw - 42px); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #f5f7fb; font-size: 11px; font-weight: 600; letter-spacing: .01em; }
+        :host(:not([data-collapsed="true"])) .short { flex: 1 1 auto; max-width: calc(100% - 28px); }
+        .toggle { flex: none; width: 24px; height: 26px; min-height: 26px; margin-left: 2px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: #c9d5e4; font-size: 18px; font-weight: 700; line-height: 1; }
         .toggle:hover:not(:disabled) { background: rgba(137,183,255,.12); }
-        .body { max-height: calc(100vh - 65px); overflow-y: auto; padding: 7px 8px 8px; border-top: 1px solid rgba(255,255,255,.08); }
+        .body { max-height: calc(100vh - 65px); overflow-y: auto; padding: 8px; border-top: 1px solid rgba(255,255,255,.08); }
         .body[hidden] { display: none; }
-        .model-list { display: grid; gap: 6px; }
-        .model-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(78px, .9fr); gap: 5px; align-items: center; min-width: 0; padding: 4px; border: 1px solid rgba(255,255,255,.10); border-radius: 10px; background: rgba(39,43,51,.76); transition: border-color 160ms ease, background 160ms ease; }
-        .model-row[data-selected="true"] { border-color: rgba(130,184,255,.72); background: rgba(53,72,98,.62); }
-        .model-choice, .effort-choice, .tool { min-height: 32px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #f4f5f7; font: inherit; font-size: 12px; }
-        .model-choice { min-width: 0; overflow: hidden; padding: 0 7px; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; cursor: pointer; }
-        .model-row[data-selected="true"] .model-choice::before { content: '✓'; display: inline-block; margin-right: 5px; color: #a9d0ff; font-size: 11px; }
-        .effort-choice { display: block; width: 100%; min-width: 0; padding: 0 7px; background: rgba(16,19,24,.56); text-overflow: ellipsis; cursor: pointer; }
-        .effort-choice:disabled, .model-choice:disabled { opacity: .5; cursor: default; }
-        option { background: #262a32; color: #f4f5f7; }
-        option:disabled { color: #999; }
-        button:hover:not(:disabled), button:focus-visible, select:focus-visible, .header:focus-visible { border-color: #83b8ff; outline: 2px solid #83b8ff; outline-offset: 1px; }
-        button:disabled, select:disabled { cursor: default; }
+        .model-controls { display: grid; gap: 6px; min-width: 0; }
+        .model-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; min-width: 0; }
+        .effort-buttons { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; min-width: 0; }
+        .model-choice, .effort-choice { min-width: 0; min-height: 28px; padding: 0 4px; border: 1px solid rgba(255,255,255,.10); border-radius: 8px; background: rgba(39,43,51,.76); color: #f4f5f7; font: inherit; font-size: 11px; font-weight: 600; text-align: center; white-space: nowrap; cursor: pointer; }
+        .model-choice[aria-pressed="true"], .effort-choice[aria-pressed="true"] { border-color: rgba(130,184,255,.78); background: rgba(53,72,98,.72); color: #f7faff; }
+        .effort-choice:nth-child(4) { grid-column: 1; }
+        .model-choice:disabled, .effort-choice:disabled { opacity: .52; cursor: default; }
+        .model-note, .effort-note { margin: 0; color: #bdc8d6; font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+        button:hover:not(:disabled), button:focus-visible, .header:focus-visible { border-color: #83b8ff; outline: 2px solid #83b8ff; outline-offset: 1px; }
+        button:disabled { cursor: default; }
         .visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
-        .actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: 5px; }
-        .tool { width: 28px; min-height: 28px; padding: 0; color: #aeb9c8; font-size: 14px; line-height: 1; cursor: pointer; }
-        .tool:hover:not(:disabled) { background: rgba(137,183,255,.12); color: #eaf3ff; }
         .storage-note { margin: 5px 0 0; color: #ffca84; font-size: 10px; }
       `;
       const panel = doc.createElement('section'); panel.className = 'panel'; panel.setAttribute('aria-label', 'ChatGPT 模型与档位');
@@ -1000,34 +1350,14 @@
       header.append(short, toggle);
       const body = doc.createElement('div'); body.className = 'body'; body.id = 'chatgpt-panel-body';
       const statusNode = doc.createElement('p'); statusNode.className = 'visually-hidden'; statusNode.setAttribute('aria-live', 'polite');
-      const modelList = doc.createElement('div'); modelList.className = 'model-list';
-      const actions = doc.createElement('div'); actions.className = 'actions';
-      const saveDefault = doc.createElement('button'); saveDefault.className = 'tool'; saveDefault.type = 'button'; saveDefault.textContent = '☆'; saveDefault.title = '设为新聊天默认'; saveDefault.setAttribute('aria-label', '设为新聊天默认');
-      const refresh = doc.createElement('button'); refresh.className = 'tool'; refresh.type = 'button'; refresh.textContent = '↻'; refresh.title = '重新读取原生控件'; refresh.setAttribute('aria-label', '重新读取原生控件');
-      const resetPosition = doc.createElement('button'); resetPosition.className = 'tool'; resetPosition.type = 'button'; resetPosition.textContent = '⌖'; resetPosition.title = '回到右下角'; resetPosition.setAttribute('aria-label', '回到右下角'); resetPosition.dataset.chatgptPanelLayout = '';
+      const controls = createModelEffortControls(doc, chooseModel, chooseEffort);
       const storageNote = doc.createElement('p'); storageNote.className = 'storage-note'; storageNote.textContent = '无法保存面板位置和折叠状态';
-      saveDefault.dataset.chatgptPanelControl = '';
-      refresh.dataset.chatgptPanelControl = '';
-      actions.append(resetPosition, saveDefault, refresh);
-      body.append(statusNode, modelList, storageNote, actions);
+      body.append(statusNode, controls.element, storageNote);
       panel.append(header, body);
       shadow.append(style, panel);
       doc.body.append(host);
-      panelUi = { host, shadow, panel, dragSurface: panel, body, keyboardSurface: header, short, toggle, storageNote, resetPosition, modelList, modelRows: new Map(), status: statusNode, saveDefault, refresh, catalogKey: '' };
+      panelUi = { host, shadow, panel, dragSurface: panel, body, keyboardSurface: header, short, toggle, storageNote, controls, status: statusNode };
       setupPanelLayout();
-      saveDefault.addEventListener('click', event => {
-        if (!event.isTrusted || !confirmedPreference || statusText !== '已确认' || confirmedPreference.effortState === 'unknown') return;
-        try {
-          prefs.setDefault(confirmedPreference);
-          statusText = '已保存为新聊天默认';
-          renderPanel();
-        } catch (error) { status(error.message); }
-      });
-      refresh.addEventListener('click', event => {
-        if (!event.isTrusted) return;
-        verified = ''; blocked = ''; pendingChoice = null; pendingNativeCapture = false;
-        status('等待空闲后重新读取'); schedule(1500);
-      });
       renderPanel();
     }
 
@@ -1052,6 +1382,8 @@
     function route() {
       const next = context(currentPath());
       if (next === key) return;
+      activeWriteController?.abort();
+      activeWriteController = null;
       prefs.migrate(key, next, pendingSend, Date.now());
       key = next;
       pendingSend = null;
@@ -1060,7 +1392,7 @@
       conversationPreference = null;
       confirmedPreference = null;
       verified = ''; blocked = ''; lastObservedButton = '';
-      effortOptions = []; effortModelKey = '';
+      effortOptions = []; effortModelKey = ''; effortObservedLabel = '';
       prefs.ensure(key);
       renderPanel();
     }
@@ -1077,11 +1409,17 @@
       if (!event.isTrusted) return;
       route();
       serial++;
+      activeWriteController?.abort();
       const path = elementsInPath(event);
       const insideNativeMenu = !!pathFind(path, '[role="menu"]');
       const modelItem = pathFind(path, '[role="menuitemradio"]');
       const strength = pathFind(path, '[role="slider"]');
       const panelControl = pathFind(path, '[data-chatgpt-panel-control]');
+      const preserveFocusChoice = pathFind(path, '[data-chatgpt-preserve-focus]');
+      if (shouldPreventPanelMouseFocus(event, preserveFocusChoice)) event.preventDefault();
+      if (event.type === 'beforeinput' && /(?:dictat|speech|voice|transcrib|语音|听写)/i.test(event.inputType || '')) {
+        voiceInputUntil = Date.now() + 2000;
+      }
       if (working && (insideNativeMenu || panelControl || pathFind(path, PICKER))) userOwnsMenu = true;
       lastInput = Date.now();
       if (event.type === 'pointerdown') pointerDown = true;
@@ -1111,7 +1449,7 @@
     }
 
     async function captureNativePreference(check) {
-      const read = await readCurrentPreferenceFromNative(check, true);
+      const read = await readCurrentPreferenceFromNative(check);
       if (read.unavailable) {
         pendingNativeCapture = false;
         blocked = 'native-unavailable|' + read.model.key;
@@ -1120,15 +1458,84 @@
       }
       const preference = normalizePreference(read.preference);
       if (!preference) throw new Error('手动选择的模型偏好无法保存');
-      prefs.save(key, preference);
-      rememberConversationPreference(preference);
       pendingNativeCapture = false;
       pendingChoice = null;
-      confirmedPreference = preference.effortState === 'unknown' ? null : preference;
-      updateEffortUi(preference.modelKey, read.effortState);
+      confirmedPreference = { ...preference, observedEffortLabel: read.observedEffortLabel || '' };
+      updateEffortUi(preference.modelKey, read.effortState, read.observedEffortLabel);
+      if (preference.effortState === 'unknown') {
+        blocked = 'unknown-effort|' + preference.modelKey;
+        status(read.observedEffortLabel
+          ? '已读取当前档位 ' + read.observedEffortLabel + '；切换能力尚未确认'
+          : '已读取模型，档位未识别；保留上次确认');
+        return;
+      }
+      prefs.save(key, preference);
+      rememberConversationPreference(preference);
       verified = targetSignature(preference, picker()?.textContent || '');
-      blocked = preference.effortState === 'unknown' ? 'unknown-effort|' + preference.modelKey : '';
-      status(preference.effortState === 'unknown' ? '模型已记录，强度控件无法识别' : '已确认');
+      blocked = '';
+      status('已确认');
+    }
+
+    async function applyModelSelection(targetModel, check) {
+      // 这里只保留既有的模型选择行为；档位读取和档位写入不会调用此路径。
+      const modelState = await openModelOptions(check);
+      let selected = modelState.selected;
+      if (selected && selected.key === targetModel.key) {
+        await closeOwnedMenus();
+        return selected;
+      }
+      if (targetModel.disabled) throw new Error(targetModel.reason || '原生模型菜单限制了此模型');
+      const element = modelState.elements.find(item => modelInfo(item).key === targetModel.key);
+      if (!element || modelUnavailableReason(element)) throw new Error('原生模型菜单禁止选择此项');
+      check();
+      element.click();
+      await delay(120);
+      check();
+      await closeOwnedMenus();
+      const verifiedState = await openModelOptions(check);
+      selected = verifiedState.selected;
+      await closeOwnedMenus();
+      if (!selected || selected.key !== targetModel.key) throw new Error('模型没有通过原生勾选状态确认');
+      return selected;
+    }
+
+    function observedPreference(read) {
+      const preference = normalizePreference(read.preference);
+      if (!preference) throw new Error('当前页面偏好无法识别');
+      if (preference.effortState === 'unknown' && confirmedPreference?.effortState === 'value' &&
+          confirmedPreference.modelKey === preference.modelKey && Number.isInteger(read.current?.value) &&
+          confirmedPreference.effortKey === effortValueKey(preference.modelKey, read.current.value)) {
+        return {
+          ...confirmedPreference,
+          observedEffortLabel: read.observedEffortLabel || confirmedPreference.effortLabel
+        };
+      }
+      return { ...preference, observedEffortLabel: read.observedEffortLabel || preference.effortLabel || '' };
+    }
+
+    async function writeEffortWithBackend(target, check) {
+      if (!effortBackend.available) return { ok: false, reason: effortBackend.reason };
+      const controller = new win.AbortController();
+      activeWriteController = controller;
+      try {
+        return await confirmEffortWrite({
+          adapter: effortBackend,
+          target,
+          payload: {
+            context: key,
+            modelKey: target.modelKey,
+            modelLabel: target.modelLabel,
+            effortKey: target.effortKey,
+            effortLabel: target.effortLabel
+          },
+          check,
+          readCurrent: () => readCurrentPreferenceFromNative(check),
+          wait: delay,
+          signal: controller.signal
+        });
+      } finally {
+        if (activeWriteController === controller) activeWriteController = null;
+      }
     }
 
     async function reconcile() {
@@ -1148,100 +1555,84 @@
       if (blocked.startsWith('native-unavailable|') && !pendingChoice && !pendingNativeCapture) return;
       if (!pendingNativeCapture && !pendingChoice && (verified === signature || blocked === signature)) return;
       working = true; ownedMenu = false; userOwnsMenu = false;
-      status(pendingChoice ? '正在应用所选组合' : '正在读取并核对原生选项');
-      const epoch = serial, routeKey = key, oldFocus = doc.activeElement;
+      status(pendingChoice ? '正在应用所选模型' : '正在读取页面档位');
+      const epoch = serial, routeKey = key;
       const check = () => cancellationCheck(epoch, routeKey);
-      let applied = null;
+      let applied = false;
       try {
         if (pendingNativeCapture) {
           await captureNativePreference(check);
+          applied = true;
           return;
         }
-        let modelState = await openModelOptions(check);
-        const targetModel = findModel(modelState.items, desired);
-        if (!targetModel) throw new Error('原生菜单没有唯一匹配的目标模型');
-        if (targetModel.disabled) {
-          blocked = signature;
-          status('不可用：' + (targetModel.reason || '原生菜单限制了此模型'));
-          return;
+
+        let read = await readCurrentPreferenceFromNative(check);
+        let actual = observedPreference(read);
+        confirmedPreference = actual;
+        updateEffortUi(actual.modelKey, read.effortState, read.observedEffortLabel);
+
+        const modelChoice = requestedChoice?.effortState === 'unknown' ||
+          (!requestedChoice && desired.modelKey !== actual.modelKey);
+        if (modelChoice) {
+          if (!catalog.length) {
+            const modelState = await readCatalogOnly(check);
+            catalog = modelState.items;
+            renderPanel();
+          }
+          const targetModel = findModel(catalog, desired);
+          if (!targetModel) throw new Error('原生菜单没有唯一匹配的目标模型');
+          if (targetModel.disabled) throw new Error(targetModel.reason || '原生模型菜单限制了此模型');
+          if (targetModel.key !== actual.modelKey) {
+            await applyModelSelection(targetModel, check);
+            await delay(120);
+            read = await readCurrentPreferenceFromNative(check);
+            actual = observedPreference(read);
+            confirmedPreference = actual;
+            updateEffortUi(actual.modelKey, read.effortState, read.observedEffortLabel);
+            if (actual.modelKey !== targetModel.key) throw new Error('页面没有确认模型切换结果');
+          }
+          pendingChoice = null;
+          if (actual.effortState !== 'unknown') {
+            prefs.save(key, actual);
+            rememberConversationPreference(actual);
+          }
+          applied = true;
         }
-        let selected = modelState.selected;
-        if (!selected || selected.key !== targetModel.key) {
-          const element = modelState.elements.find(item => modelInfo(item).key === targetModel.key);
-          if (!element || modelUnavailableReason(element)) {
-            blocked = signature;
-            status('不可用：原生模型菜单禁止选择此项');
+
+        const needsEffort = desired.effortState === 'value' && !preferenceMatches(actual, desired);
+        if (needsEffort) {
+          if (!effortBackend.available) {
+            pendingChoice = null;
+            blocked = 'backend-unavailable|' + signature;
+            status('档位修改受阻：' + effortBackend.reason);
+            applied = true;
             return;
           }
-          check();
-          element.click();
-          await delay(120);
-          check();
-          await closeOwnedMenus();
-          modelState = await openModelOptions(check);
-          selected = modelState.selected;
-          if (!selected || selected.key !== targetModel.key) throw new Error('模型没有通过原生勾选状态确认');
-        }
-        if (selected.disabled) {
-          blocked = signature;
-          status('不可用：' + (selected.reason || '所选模型受原生限制'));
-          return;
-        }
-        await closeOwnedMenus();
-        await openParentMenu(check);
-        const effortState = await discoverEfforts(check, selected.key);
-        updateEffortUi(selected.key, effortState);
-        let confirmed;
-        if (effortState.kind === 'value') {
-          let chosen = null;
-          if (desired.effortState === 'value') {
-            chosen = findEffortOption(effortState.options, { ...desired, modelKey: selected.key });
+          const result = await writeEffortWithBackend(desired, check);
+          if (!result.ok) {
+            pendingChoice = null;
+            blocked = effortBackend.available ? signature : 'backend-unavailable|' + signature;
+            status('档位修改受阻：' + result.reason);
+            return;
           }
-          if (desired.effortState === 'unknown' && requestedChoice && requestedChoice.effortState === 'unknown') chosen = effortState.current;
-          if (!chosen) throw new Error('目标档位不在该模型当前提供的原生选项中');
-          let verifiedEffort = effortState.current;
-          let observedLabel = chosen.label;
-          if (!effortState.current || effortState.current.key !== chosen.key) {
-            const beforeEffort = currentEffort();
-            verifiedEffort = await moveSliderTo(chosen.value, check);
-            observedLabel = await waitForEffortCaption(
-              verifiedEffort,
-              beforeEffort.statusText,
-              beforeEffort.label || '',
-              chosen.label,
-              check
-            );
-          }
-          verifiedEffort = currentEffort();
-          if (verifiedEffort.state !== 'range' || verifiedEffort.value !== chosen.value) throw new Error('强度档位没有通过原生滑杆值确认');
-          const actualLabel = resolveEffortLabel(chosen.label, observedLabel);
-          const resolvedOptions = effortState.options.map(option =>
-            option.value === chosen.value && actualLabel ? { ...option, label: actualLabel } : option
-          );
-          updateEffortUi(selected.key, { ...effortState, options: resolvedOptions });
-          confirmed = {
-            modelKey: selected.key,
-            modelLabel: selected.label,
-            effortKey: chosen.key,
-            effortLabel: actualLabel || chosen.label,
-            effortState: 'value'
-          };
-        } else if (effortState.kind === 'none') {
-          if (desired.effortState === 'value' && !(requestedChoice && requestedChoice.effortState === 'unknown')) throw new Error('已保存的档位与该模型当前控件不匹配');
-          confirmed = { modelKey: selected.key, modelLabel: selected.label, effortKey: null, effortLabel: '', effortState: 'none' };
-        } else {
-          if (desired.effortState === 'value') throw new Error(effortState.reason || '强度控件无法识别');
-          confirmed = { modelKey: selected.key, modelLabel: selected.label, effortKey: null, effortLabel: '', effortState: 'unknown' };
+          actual = result.preference;
+          confirmedPreference = actual;
+          updateEffortUi(actual.modelKey, result.read.effortState, result.read.observedEffortLabel);
+          prefs.save(key, actual);
+          if (requestedChoice) rememberConversationPreference(actual);
         }
-        check();
-        prefs.save(key, confirmed);
-        if (requestedChoice) rememberConversationPreference(confirmed);
-        pendingChoice = null; pendingNativeCapture = false;
-        confirmedPreference = confirmed.effortState === 'unknown' ? null : confirmed;
-        applied = confirmed;
-        verified = targetSignature(confirmed, picker()?.textContent || '');
-        blocked = confirmed.effortState === 'unknown' ? 'unknown-effort|' + confirmed.modelKey : '';
-        status(confirmed.effortState === 'unknown' ? '模型已确认，强度控件无法识别' : '已确认');
+
+        if (requestedChoice?.effortState === 'value') pendingChoice = null;
+        if (requestedChoice && !needsEffort && requestedChoice.effortState === 'unknown') rememberConversationPreference(actual);
+        confirmedPreference = actual;
+        verified = targetSignature(actual, picker()?.textContent || '');
+        blocked = actual.effortState === 'unknown' ? 'unknown-effort|' + actual.modelKey : '';
+        status(actual.effortState === 'unknown'
+          ? actual.observedEffortLabel
+            ? '已读取当前档位 ' + actual.observedEffortLabel + '；档位修改受阻'
+            : '已读取模型，档位未识别'
+          : '已确认');
+        applied = true;
       } catch (error) {
         try { check(); } catch (_) {
           blocked = ''; pendingChoice = null;
@@ -1249,21 +1640,17 @@
           return;
         }
         blocked = targetSignature(desired, normalize(picker()?.textContent || ''));
-        // 保留最后一次已核对的页面内容，避免一次读取失败让折叠态退化成省略号。
         status('暂停：' + error.message);
         console.warn('[ChatGPT model preference]', error.message);
       } finally {
         await closeOwnedMenus();
-        if (serial === epoch && oldFocus?.isConnected && typeof oldFocus.focus === 'function') {
-          try { oldFocus.focus({ preventScroll: true }); } catch (_) { /* ignored */ }
-        }
         working = false;
         if (!applied && (pendingNativeCapture || pendingChoice)) schedule(1450);
         renderPanel();
       }
     }
 
-    for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'keydown', 'keyup', 'click', 'input', 'change']) {
+    for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'keydown', 'keyup', 'click', 'beforeinput', 'input', 'change']) {
       doc.addEventListener(type, interaction, true);
     }
     doc.addEventListener('compositionstart', () => { composing = true; }, true);
@@ -1272,17 +1659,25 @@
       if (panelUi && !panelUi.host.isConnected) mountPanel();
       let settingsChanged = false;
       for (const record of records) {
-        if (record.type === 'attributes' && ['aria-valuenow', 'aria-checked', 'aria-expanded', 'aria-disabled', 'disabled'].includes(record.attributeName)) {
+        if (record.type === 'attributes' && [
+          'aria-valuenow', 'aria-valuetext', 'aria-checked', 'aria-expanded', 'aria-disabled',
+          'aria-label', 'aria-description', 'aria-describedby', 'data-disabled', 'data-state', 'disabled', 'title'
+        ].includes(record.attributeName)) {
           const target = record.target;
           if (target.closest?.('[role="menu"],button[aria-label*="模型"],button[aria-label*="model"]')) settingsChanged = true;
         }
         if ((record.type === 'childList' || record.type === 'characterData') &&
             (record.target.parentElement?.closest?.('[role="menu"]') || record.target.closest?.(PICKER))) settingsChanged = true;
       }
-      if (settingsChanged) schedule();
+      const menuOpen = menus().length > 0;
+      if (menuOpen) observeVisibleModelCatalog();
+      if (settingsChanged && !menuOpen) schedule();
     }).observe(doc.documentElement, {
       childList: true, subtree: true, characterData: true, attributes: true,
-      attributeFilter: ['aria-valuenow', 'aria-checked', 'aria-expanded', 'aria-disabled', 'disabled']
+      attributeFilter: [
+        'aria-valuenow', 'aria-valuetext', 'aria-checked', 'aria-expanded', 'aria-disabled',
+        'aria-label', 'aria-description', 'aria-describedby', 'data-disabled', 'data-state', 'disabled', 'title'
+      ]
     });
     win.addEventListener('storage', event => {
       if (event.key === PREFIX + key) {
@@ -1307,6 +1702,7 @@
     }, 1500);
     prefs.ensure(key);
     mountPanel();
+    observeVisibleModelCatalog();
     schedule(250);
   }
 
@@ -1319,8 +1715,23 @@
     Preferences,
     context,
     normalize,
+    resolveCurrentModelPreference,
     effortLabelFromStatus,
     effortItemIndexFromStatus,
+    canonicalEffortLabel,
+    effortLabelFromText,
+    panelModelSlot,
+    panelEffortSlot,
+    shouldPreventPanelMouseFocus,
+    readVisibleModelCatalog,
+    createModelEffortControls,
+    observeEffortPreference,
+    createEffortBackendAdapter,
+    confirmEffortWrite,
+    preferenceMatches,
+    classifyModelAvailability,
+    modelAvailabilityLabel,
+    effortRowPresentation,
     effortKey,
     effortValueKey,
     findEffortOption,
@@ -1333,6 +1744,7 @@
     normalizePanelSettings,
     readPanelSettings,
     clampPanelPosition,
+    preferredExpandedPanelPosition,
     preferredPanelPosition,
     panelSummary,
     resolveConversationPreference,
