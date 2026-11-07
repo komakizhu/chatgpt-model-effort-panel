@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 模型与档位
 // @namespace    local.chatgpt-preference
-// @version      0.6.0
+// @version      0.6.1
 // @description  读取 ChatGPT 页面真实模型与档位，并按聊天保存已确认偏好。
 // @match        https://chatgpt.com/*
 // @run-at       document-end
@@ -1506,8 +1506,9 @@
       panelUi.short.title = short.text;
       panelUi.short.setAttribute('aria-label', short.text || summaryText);
       panelUi.storageNote.hidden = panelStorageAvailable;
-      panelUi.toggle.hidden = !scriptEnabled;
+      panelUi.toggle.hidden = false;
       panelUi.body.hidden = !scriptEnabled || panelSettings.collapsed;
+      panelUi.feature.element.hidden = panelSettings.collapsed;
       panelUi.feature.update(scriptEnabled, featureReason);
     }
 
@@ -1561,6 +1562,7 @@
       if (!drag) return;
       const previous = drag;
       drag = null;
+      updatePanelActivity();
       pointerDown = false;
       if (!cancelled && previous.moved) {
         panelSettings.position = previous.position;
@@ -1575,23 +1577,46 @@
       schedule(1450);
     }
 
+    let updatePanelActivity = () => {};
     function setPanelCollapsed(collapsed) {
-      if (!scriptEnabled) return;
       if (collapsed && panelUi.body.contains(panelUi.shadow.activeElement)) panelUi.toggle.focus({ preventScroll: true });
       panelSettings.collapsed = collapsed;
       panelUi.host.dataset.collapsed = String(collapsed);
       panelUi.body.hidden = !scriptEnabled || collapsed;
+      panelUi.feature.element.hidden = collapsed;
       panelUi.toggle.textContent = collapsed ? '▴' : '▾';
       panelUi.toggle.setAttribute('aria-label', collapsed ? '展开模型与档位面板' : '折叠模型与档位面板');
       panelUi.toggle.setAttribute('aria-expanded', String(!collapsed));
       savePanelSettings();
+      updatePanelActivity();
       queuePanelPosition();
     }
 
     function setupPanelLayout() {
       const { host, panel, keyboardSurface, toggle, body } = panelUi;
       body.hidden = !scriptEnabled || panelSettings.collapsed;
-      toggle.hidden = !scriptEnabled;
+      toggle.hidden = false;
+      panelUi.feature.element.hidden = panelSettings.collapsed;
+      let idleTimer = 0;
+      let hovering = false;
+      let focused = false;
+      updatePanelActivity = () => {
+        win.clearTimeout(idleTimer);
+        host.dataset.idle = 'false';
+        if (panelSettings.collapsed && !hovering && !focused && !drag) {
+          idleTimer = win.setTimeout(() => {
+            if (panelSettings.collapsed && !hovering && !focused && !drag) host.dataset.idle = 'true';
+          }, 5000);
+        }
+      };
+      panel.addEventListener('pointerenter', () => { hovering = true; updatePanelActivity(); });
+      panel.addEventListener('pointerleave', () => { hovering = false; updatePanelActivity(); });
+      panel.addEventListener('focusin', () => { focused = true; updatePanelActivity(); });
+      panel.addEventListener('focusout', event => {
+        focused = Boolean(event.relatedTarget && panel.contains(event.relatedTarget));
+        updatePanelActivity();
+      });
+      panel.addEventListener('pointerdown', () => updatePanelActivity());
       toggle.textContent = panelSettings.collapsed ? '▴' : '▾';
       toggle.setAttribute('aria-label', panelSettings.collapsed ? '展开模型与档位面板' : '折叠模型与档位面板');
       toggle.setAttribute('aria-expanded', String(!panelSettings.collapsed));
@@ -1653,6 +1678,7 @@
         });
       }
       applyPanelPosition();
+      updatePanelActivity();
     }
 
     function mountPanel() {
@@ -1672,6 +1698,7 @@
       style.textContent = `
         :host { all: initial; position: fixed; right: 12px; bottom: 12px; z-index: 2147483647; display: block; width: min(198px, calc(100vw - 16px)); color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         :host([data-collapsed="true"]) { width: max-content; max-width: min(148px, calc(100vw - 16px)); }
+        :host([data-collapsed="true"][data-idle="true"]) { opacity: .55; }
         * { box-sizing: border-box; }
         .panel { width: 100%; border: 1px solid rgba(255,255,255,.14); border-radius: 13px; background: rgba(25,28,34,.96); color: #f4f5f7; box-shadow: 0 8px 26px rgba(0,0,0,.28); backdrop-filter: blur(16px); cursor: grab; touch-action: manipulation; }
         .panel.is-dragging { cursor: grabbing; user-select: none; touch-action: none; }
@@ -1695,6 +1722,7 @@
         .visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
         .storage-note { margin: 5px 0 0; color: #ffca84; font-size: 10px; }
         .feature-toggle { min-height: 24px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding: 2px 4px 0; color: #bdc8d6; font-size: 10px; }
+        .feature-toggle[hidden] { display: none; }
         .feature-state { display: block; max-width: 130px; white-space: normal; overflow-wrap: anywhere; line-height: 1.25; }
         .feature-switch { min-width: 38px; min-height: 22px; padding: 0 6px; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(39,43,51,.9); color: #e9edf4; font: inherit; font-weight: 600; cursor: pointer; }
         .feature-toggle[data-enabled="true"] .feature-switch { border-color: rgba(130,184,255,.65); background: rgba(53,72,98,.72); }

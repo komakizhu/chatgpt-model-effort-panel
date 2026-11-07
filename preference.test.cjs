@@ -476,6 +476,46 @@ test('页面未知模型时仍显示真实档位，且序号不匹配时不确�
   });
 });
 
+test('折叠面板闲置变淡，交互恢复清晰且关闭后可展开开启', () => {
+  const win = fakeChatGPTWindow({ enabled: false });
+  const originalSetTimeout = win.setTimeout;
+  const originalClearTimeout = win.clearTimeout;
+  let idle = null;
+  win.setTimeout = (callback, ms) => ms === 5000 ? (idle = { callback }) : originalSetTimeout(callback, ms);
+  win.clearTimeout = id => { if (id === idle) idle = null; else originalClearTimeout(id); };
+  const app = start(win);
+  const host = win.document.body.children.find(element => element.dataset.chatgptModelPanel);
+  const panel = host.shadowRoot.querySelector('.panel');
+  const toggle = host.shadowRoot.querySelector('.toggle');
+  const feature = host.shadowRoot.querySelector('.feature-toggle');
+  const featureSwitch = host.shadowRoot.querySelector('.feature-switch');
+  assert.equal(feature.hidden, true);
+  assert.equal(toggle.hidden, false);
+  assert.ok(idle);
+  idle.callback();
+  assert.equal(host.dataset.idle, 'true');
+  panel.dispatchEvent({ type: 'pointerenter', bubbles: false });
+  assert.equal(host.dataset.idle, 'false');
+  assert.equal(idle, null);
+  panel.dispatchEvent({ type: 'pointerleave', bubbles: false });
+  assert.ok(idle);
+  toggle.click(true);
+  assert.equal(feature.hidden, false);
+  assert.equal(host.dataset.idle, 'false');
+  assert.equal(idle, null);
+  featureSwitch.click(true);
+  assert.equal(app.enabled, true);
+  featureSwitch.click(true);
+  assert.equal(app.enabled, false);
+  toggle.click(true);
+  assert.equal(feature.hidden, true);
+  toggle.click(true);
+  assert.equal(feature.hidden, false);
+  featureSwitch.click(true);
+  assert.equal(app.enabled, true);
+  featureSwitch.click(true);
+});
+
 test('总开关通过可访问的 switch 控件通知并反映持久状态', () => {
   let enabled = true;
   const control = createFeatureToggleControl(testDocument(), () => { enabled = !enabled; });
