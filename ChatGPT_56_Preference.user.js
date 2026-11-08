@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 模型与档位
 // @namespace    local.chatgpt-preference
-// @version      0.6.1
-// @description  读取 ChatGPT 页面真实模型与档位，并按聊天保存已确认偏好。
+// @version      0.7.0
+// @description  读取模型与强度，按聊天保存偏好并记住面板选择。
 // @match        https://chatgpt.com/*
 // @run-at       document-end
 // @inject-into  content
@@ -17,7 +17,9 @@
 })(typeof window === 'undefined' ? null : window, function () {
   'use strict';
 
-  const VERSION = '0.5.4';
+  const VERSION = '0.7.0';
+  const MODEL_CATALOG_TTL_MS = 60000;
+  const MODEL_CATALOG_RETRY_MS = 5000;
   const PANEL_KEY = 'chatgpt-model-panel-v1';
   const ENABLED_KEY = 'chatgpt-model-preference-enabled-v1';
   const PREFIX = 'chatgpt-model-preference-v2:';
@@ -416,8 +418,9 @@
     root.append(modelGroup, modelNotice, effortGroup, effortNotice);
 
     function update({
-      catalog = [], current = null, effortModelKey = '', effortOptions = [], observedEffortLabel = '',
-      writerAvailable = false, writerReason = '未发现可确认的同源档位接口', pendingChoice = null
+      catalog = [], catalogFresh = false, catalogLoading = false, catalogWaiting = false, catalogReason = '',
+      current = null, effortModelKey = '', effortOptions = [], observedEffortLabel = '',
+      writerAvailable = false, writerReason = '未发现可确认的强度写入接口', pendingChoice = null
     } = {}) {
       const byModelSlot = new Map(PANEL_MODEL_SLOTS.map(slot => [slot.key, []]));
       for (const model of catalog) {
@@ -431,32 +434,39 @@
         const matches = byModelSlot.get(slot.key);
         const currentMatches = current?.modelKey && panelModelSlot(current.modelLabel)?.key === slot.key;
         const ambiguous = matches.length > 1;
-        let model = matches.length === 1 ? matches[0] : null;
+        let model = catalogFresh && matches.length === 1 ? matches[0] : null;
         if (!model && currentMatches) {
           model = {
             key: current.modelKey,
             label: current.modelLabel,
             disabled: true,
-            availability: { state: 'unknown', reason: ambiguous ? '模型目录存在重复项' : '模型目录尚未读取' },
-            reason: ambiguous ? '模型目录存在重复项' : '模型目录尚未读取'
+            availability: { state: 'unknown', reason: ambiguous ? '模型目录存在重复项' : catalogFresh ? '当前模型不在列表中' : '模型列表未读取' },
+            reason: ambiguous ? '模型目录存在重复项' : catalogFresh ? '当前模型不在列表中' : '模型列表未读取'
           };
         }
-        const reason = ambiguous
+        const reason = !catalogFresh
+          ? catalogLoading ? '正在读取模型列表' : catalogWaiting ? '等待页面空闲' : catalogReason || '模型列表未读取'
+          : ambiguous
           ? '模型目录存在重复项，暂不能安全选择'
           : !model
-            ? '状态未确认，暂不能选择'
+            ? '页面未提供此模型'
             : modelAvailabilityLabel(model) || (model.availability?.state === 'unknown' ? '状态未确认，暂不能选择' : '');
         const selected = Boolean(currentMatches && (!model || model.key === current.modelKey));
         const button = modelButtons.get(slot.key);
-        button.disabled = !model || ambiguous || model.disabled || model.availability?.state === 'unknown';
+        button.disabled = !catalogFresh || !model || ambiguous || model.disabled || model.availability?.state === 'unknown';
         button.setAttribute('aria-pressed', String(selected));
         button.setAttribute('aria-label', slot.label + (selected ? '，当前模型' : '') + (reason ? '，' + reason : ''));
         button.title = reason || slot.label;
         button.dataset.selected = String(selected);
         if (model && !button.disabled) nextModelBySlot.set(slot.key, model);
-        if (reason) modelMessages.push(slot.label + '：' + reason);
+        if (reason && catalogFresh) modelMessages.push(slot.label + '：' + reason);
       }
       modelBySlot = nextModelBySlot;
+      if (!catalogFresh) {
+        modelMessages.push(catalogLoading ? '读取模型列表…' : catalogWaiting
+          ? '等页面空闲后读取模型列表'
+          : catalogReason ? '模型列表不可读：' + catalogReason : '模型列表未读取');
+      }
       modelNotice.textContent = modelMessages.join('；');
       modelNotice.hidden = modelMessages.length === 0;
 
@@ -477,17 +487,17 @@
       const nextEffortBySlot = new Map();
       let effortMessage = '';
       if (modelPending) {
-        effortMessage = '等待页面确认模型切换，强度选项暂时停用';
+        effortMessage = '模型确认中，强度暂不可选';
       } else if (!current) {
-        effortMessage = '等待页面确认当前模型和强度';
+        effortMessage = '等待页面确认模型与强度';
       } else if (current.effortState === 'none') {
-        effortMessage = '当前模型没有强度设置';
-      } else if (current.effortState === 'unknown' && !currentLabel) {
-        effortMessage = '档位未识别，强度选项暂时停用';
+        effortMessage = '当前模型无强度设置';
       } else if (!writerAvailable) {
-        effortMessage = '档位修改受阻：' + writerReason;
+        effortMessage = '无法切换：' + writerReason;
+      } else if (current.effortState === 'unknown' && !currentLabel) {
+        effortMessage = '强度未识别';
       } else if (!effortOptions.length) {
-        effortMessage = '页面尚未确认可用的强度选项';
+        effortMessage = '强度选项未确认';
       }
 
       for (const slot of PANEL_EFFORT_SLOTS) {
@@ -507,10 +517,10 @@
           nextEffortBySlot.set(slot.key, { model, option });
         } else if (!option) {
           reason = isCurrent && current?.effortState === 'unknown'
-            ? '当前名称已识别，但档位值未确认'
-            : '选项未确认：页面未提供此档位的名称和值';
+            ? '当前名称已读到，强度值未确认'
+            : '此档未确认：页面未提供名称和值';
         } else if (!writerAvailable) {
-          reason = '档位修改受阻：' + writerReason;
+          reason = '无法切换：' + writerReason;
         } else if (modelPending) {
           reason = '等待页面确认模型切换';
         } else if (!currentModelKnown) {
@@ -521,8 +531,8 @@
         button.dataset.selected = String(Boolean(isCurrent));
       }
       effortBySlot = nextEffortBySlot;
-      if (!effortMessage && effortOptions.length < PANEL_EFFORT_SLOTS.length) {
-        effortMessage = '未读取到的强度选项保持停用';
+      if (!effortMessage && writerAvailable && effortOptions.length < PANEL_EFFORT_SLOTS.length) {
+        effortMessage = '未确认的强度选项保持停用';
       }
       effortNotice.textContent = effortMessage;
       effortNotice.hidden = !effortMessage;
@@ -619,7 +629,7 @@
   }
 
   function createEffortBackendAdapter(implementation) {
-    const reason = '未发现可确认的同源档位接口';
+    const reason = '未发现可确认的强度写入接口';
     const canRead = !!implementation && typeof implementation.read === 'function';
     const canWrite = !!implementation && typeof implementation.write === 'function';
     const invoke = async (method, payload, options) => {
@@ -666,7 +676,7 @@
     adapter, payload, target, readCurrent, check, wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
     now = () => Date.now(), timeoutMs = 5000, signal
   }) {
-    if (!adapter?.available) return { ok: false, reason: adapter?.reason || '未发现可确认的同源档位接口' };
+    if (!adapter?.available) return { ok: false, reason: adapter?.reason || '未发现可确认的强度写入接口' };
     check();
     if (signal?.aborted) return { ok: false, reason: '档位修改已取消' };
     const written = await adapter.write(payload, { signal });
@@ -773,7 +783,7 @@
       return { label: modelAvailabilityLabel(model) || '不可用', disabled: true, title: modelAvailabilityLabel(model) || '模型不可用' };
     }
     if (selected && label && (!options || options.length === 0)) {
-      const reason = writerAvailable ? '已识别当前档位，其他选项尚未确认' : '档位修改受阻：未发现可确认的同源档位接口';
+      const reason = writerAvailable ? '已识别当前强度，其他选项未确认' : '无法切换：未发现可确认的强度写入接口';
       return { label, disabled: true, title: reason };
     }
     if (!selected || !options || options.length === 0) {
@@ -783,7 +793,7 @@
       return {
         label: '',
         disabled: true,
-        title: '档位修改受阻：未发现可确认的同源档位接口'
+        title: '无法切换：未发现可确认的强度写入接口'
       };
     }
     return { label: '', disabled: false, title: '' };
@@ -953,10 +963,11 @@
     let working = false, ownedMenu = false, userOwnsMenu = false, activeWriteController = null;
     let pendingChoice = null, pendingNativeCapture = false, manualChoiceUnconfirmed = false;
     let conversationPreference = null;
-    let preferenceStorageWarning = false;
+    let preferenceStorageWarning = false, defaultStorageWarning = false, selectionMessage = '';
     let verified = '', blocked = null, lastObservedButton = '', lastObservedPicker = null;
     let statusText = '正在读取原生模型选项';
     let catalog = [], catalogReadSignature = '', catalogContext = key, catalogFresh = false;
+    let catalogReadAt = 0, catalogReadRetryAt = 0, catalogLoading = false, catalogWaiting = false, catalogReadError = '';
     let menuContexts = new WeakMap();
     let effortOptions = [], effortModelKey = '', effortObservedLabel = '', confirmedPreference = null, pageObservation = null;
     let attemptedModelSync = '', attemptedCatalogProbe = '';
@@ -1006,6 +1017,9 @@
       catalogReadSignature = '';
       catalogContext = key;
       catalogFresh = false;
+      catalogReadAt = 0;
+      catalogReadRetryAt = 0;
+      catalogReadError = '';
       attemptedModelSync = '';
       attemptedCatalogProbe = '';
       verified = '';
@@ -1016,12 +1030,18 @@
     function acceptCatalog(items) {
       if (!items.length) return false;
       const signature = modelCatalogSignature(items);
-      catalogFresh = true;
-      if (signature === catalogReadSignature && catalogContext === key) return false;
       const previousSignature = catalogContext === key ? catalogReadSignature : '';
+      catalogFresh = true;
+      catalogReadAt = Date.now();
+      catalogReadRetryAt = 0;
+      catalogReadError = '';
       catalogReadSignature = signature;
       catalog = items;
       catalogContext = key;
+      if (signature === previousSignature) {
+        renderPanel();
+        return false;
+      }
       if (previousSignature !== signature) {
         attemptedCatalogProbe = '';
         attemptedModelSync = '';
@@ -1047,7 +1067,7 @@
         normalizedKey(panelModelLabel(previousModel)) !== normalizedKey(panelModelLabel(nextModel)));
       const identityLost = Boolean(previousModel && !nextModel);
       const conflictsWithCatalog = Boolean(!previousModel && nextModel &&
-        catalogFresh && selectedIn(catalog) &&
+        hasFreshCatalog() && selectedIn(catalog) &&
         !modelIdentityMatches({ label: nextModel }, selectedIn(catalog)));
       if (pickerReplaced || identityChanged || identityLost || conflictsWithCatalog) resetCatalogEvidence();
       return true;
@@ -1078,11 +1098,16 @@
       return checked.length === 1 ? checked[0] : null;
     };
 
+    function hasFreshCatalog() {
+      return catalogFresh && catalogContext === key && Date.now() - catalogReadAt < MODEL_CATALOG_TTL_MS;
+    }
+
     function status(value) {
       if (!scriptEnabled) return;
-      statusText = preferenceStorageWarning && !/无法保存到浏览器/.test(value)
-        ? value + '；当前标签页已记忆，但聊天偏好无法保存到浏览器'
-        : value;
+      const warnings = [];
+      if (preferenceStorageWarning && !value.includes('当前聊天偏好未保存')) warnings.push('当前聊天偏好未保存');
+      if (defaultStorageWarning && !value.includes('新聊天默认未保存')) warnings.push('新聊天默认未保存');
+      statusText = [value, ...warnings].filter(Boolean).join('；');
       if (panelUi) renderPanel();
     }
 
@@ -1354,9 +1379,10 @@
       };
       const saved = prefs.ensure(key);
       const buttonText = readNativeModelText(button);
-      const sameContextCatalog = catalogContext === key ? catalog : [];
-      const checked = catalogFresh ? sameContextCatalog.filter(item => item.checked) : [];
-      const selected = catalogFresh ? selectedIn(sameContextCatalog) : null;
+      const catalogAvailable = hasFreshCatalog();
+      const sameContextCatalog = catalogAvailable ? catalog : [];
+      const checked = catalogAvailable ? sameContextCatalog.filter(item => item.checked) : [];
+      const selected = catalogAvailable ? selectedIn(sameContextCatalog) : null;
       const model = checked.length > 1
         ? null
         : resolveCurrentModelPreference(
@@ -1364,7 +1390,7 @@
           saved,
           buttonText,
           selected,
-          catalogFresh
+          catalogAvailable
         );
       const current = currentEffort();
       const statusText = current.menu ? readEffortStatus(current.menu).raw : current.statusText;
@@ -1416,9 +1442,24 @@
 
     async function readCatalogOnly(check) {
       // 仅读取模型列表供展开态使用，不读取或探测档位。
-      const state = await openModelOptions(check);
-      await closeOwnedMenus();
-      return state;
+      try {
+        return await openModelOptions(check);
+      } finally {
+        await closeOwnedMenus(check);
+      }
+    }
+
+    async function readConfirmedPanelPreference(check, currentRead) {
+      if (currentRead?.effort?.state !== 'unknown') return currentRead;
+      try {
+        await openParentMenu(check);
+        return readCurrentPreferenceFromNative(check);
+      } catch (error) {
+        check();
+        return currentRead;
+      } finally {
+        await closeOwnedMenus(check);
+      }
     }
 
     function targetSignature(preference, buttonText) {
@@ -1441,6 +1482,31 @@
       }
     }
 
+    function saveConfirmedPanelPreference(preference) {
+      const normalized = normalizePreference(preference);
+      if (!normalized) return null;
+      rememberConversationPreference(normalized);
+      const conversationSaved = saveConversationPreference(normalized);
+      let defaultSaved = false;
+      const defaultSkipped = normalized.effortState === 'unknown';
+      if (!defaultSkipped) {
+        try {
+          prefs.setDefault(normalized);
+          defaultStorageWarning = false;
+          defaultSaved = true;
+        } catch (_) {
+          defaultStorageWarning = true;
+        }
+      }
+      const warnings = [];
+      if (!conversationSaved) warnings.push('当前聊天偏好未保存');
+      if (defaultSkipped) warnings.push('强度未确认，新聊天默认未更改');
+      else if (!defaultSaved) warnings.push('新聊天默认未保存');
+      selectionMessage = warnings.length ? warnings.join('；') : '已记为新聊天默认';
+      status(warnings.length ? '页面已确认模型' : '已确认并记为新聊天默认');
+      return { preference: normalized, conversationSaved, defaultSaved, defaultSkipped };
+    }
+
     function savedConversationPreference() {
       return conversationPreference && conversationPreference.key === key ? conversationPreference.preference : null;
     }
@@ -1452,11 +1518,13 @@
     function chooseModel(item) {
       if (!scriptEnabled || !pageActive || !item || item.disabled || item.availability?.state === 'unknown') return;
       route();
+      defaultStorageWarning = false;
       pendingChoice = { modelKey: item.key, modelLabel: item.label, effortKey: null, effortLabel: '', effortState: 'unknown' };
       attemptedModelSync = '';
       attemptedCatalogProbe = '';
       verified = ''; blocked = null;
-      status('等待空闲后应用所选模型');
+      selectionMessage = '等待页面确认模型';
+      status('等待页面确认模型');
       schedule(1500);
     }
 
@@ -1464,7 +1532,7 @@
       if (!scriptEnabled || !pageActive) return;
       if (!effortBackend.available) {
         setBlock('backend-unavailable', key, effortBackend.reason);
-        status('档位修改受阻：' + effortBackend.reason);
+        status('无法切换：' + effortBackend.reason);
         return;
       }
       const selected = item && !item.disabled ? item : null;
@@ -1474,6 +1542,7 @@
         return;
       }
       route();
+      defaultStorageWarning = false;
       pendingChoice = {
         modelKey: selected.key,
         modelLabel: selected.label,
@@ -1482,7 +1551,8 @@
         effortState: 'value'
       };
       verified = ''; blocked = null;
-      status('等待空闲后应用所选档位');
+      selectionMessage = '等待页面确认强度';
+      status('等待页面确认强度');
       schedule(1500);
     }
 
@@ -1490,8 +1560,13 @@
       if (!panelUi) return;
       const current = pageObservation?.preference || null;
       panelUi.status.textContent = statusText;
+      const catalogAvailable = hasFreshCatalog();
       panelUi.controls.update({
-        catalog,
+        catalog: catalogAvailable ? catalog : [],
+        catalogFresh: catalogAvailable,
+        catalogLoading,
+        catalogWaiting,
+        catalogReason: catalogReadError,
         current,
         effortModelKey,
         effortOptions,
@@ -1505,6 +1580,8 @@
       panelUi.short.textContent = summaryText;
       panelUi.short.title = short.text;
       panelUi.short.setAttribute('aria-label', short.text || summaryText);
+      panelUi.selectionNote.textContent = selectionMessage;
+      panelUi.selectionNote.hidden = !selectionMessage;
       panelUi.storageNote.hidden = panelStorageAvailable;
       panelUi.toggle.hidden = false;
       panelUi.body.hidden = !scriptEnabled || panelSettings.collapsed;
@@ -1590,6 +1667,11 @@
       savePanelSettings();
       updatePanelActivity();
       queuePanelPosition();
+      if (!collapsed) {
+        catalogReadRetryAt = 0;
+        catalogWaiting = false;
+        schedule(1450);
+      }
     }
 
     function setupPanelLayout() {
@@ -1720,6 +1802,8 @@
         button:hover:not(:disabled), button:focus-visible, .header:focus-visible { border-color: #83b8ff; outline: 2px solid #83b8ff; outline-offset: 1px; }
         button:disabled { cursor: default; }
         .visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
+        .selection-note { margin: 2px 0 0; color: #ffca84; font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+        .selection-note[hidden] { display: none; }
         .storage-note { margin: 5px 0 0; color: #ffca84; font-size: 10px; }
         .feature-toggle { min-height: 24px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding: 2px 4px 0; color: #bdc8d6; font-size: 10px; }
         .feature-toggle[hidden] { display: none; }
@@ -1740,13 +1824,15 @@
       const body = doc.createElement('div'); body.className = 'body'; body.id = 'chatgpt-panel-body';
       const statusNode = doc.createElement('p'); statusNode.className = 'visually-hidden'; statusNode.setAttribute('aria-live', 'polite');
       const controls = createModelEffortControls(doc, chooseModel, chooseEffort);
+      const selectionNote = doc.createElement('p'); selectionNote.className = 'selection-note';
+      selectionNote.setAttribute('role', 'status'); selectionNote.setAttribute('aria-live', 'polite'); selectionNote.hidden = true;
       const storageNote = doc.createElement('p'); storageNote.className = 'storage-note'; storageNote.textContent = '无法保存面板位置和折叠状态';
-      body.append(statusNode, controls.element, storageNote);
+      body.append(statusNode, controls.element, selectionNote, storageNote);
       const feature = createFeatureToggleControl(doc, toggleFeature);
       panel.append(header, body, feature.element);
       shadow.append(style, panel);
       doc.body.append(host);
-      panelUi = { host, shadow, panel, dragSurface: panel, body, keyboardSurface: header, short, toggle, feature, storageNote, controls, status: statusNode };
+      panelUi = { host, shadow, panel, dragSurface: panel, body, keyboardSurface: header, short, toggle, feature, storageNote, selectionNote, controls, status: statusNode };
       setupPanelLayout();
       renderPanel();
     }
@@ -1789,6 +1875,8 @@
       lastObservedPicker = null;
       attemptedModelSync = ''; attemptedCatalogProbe = '';
       catalog = []; catalogReadSignature = ''; catalogContext = next; catalogFresh = false;
+      catalogReadAt = 0; catalogReadRetryAt = 0; catalogLoading = false; catalogWaiting = false; catalogReadError = '';
+      selectionMessage = ''; preferenceStorageWarning = false;
       menuContexts = new WeakMap();
       effortOptions = []; effortModelKey = ''; effortObservedLabel = '';
       prefs.ensure(key);
@@ -1831,6 +1919,7 @@
         (insideNativeMenu && event.type === 'click' && !!resetItem);
       if (modelActivation) {
         catalogFresh = false;
+        selectionMessage = '';
         manualChoiceUnconfirmed = true;
         attemptedModelSync = ''; attemptedCatalogProbe = ''; verified = ''; blocked = null;
       }
@@ -1883,6 +1972,7 @@
       updateEffortUi(preference.modelKey, read.effortState, read.observedEffortLabel);
       rememberConversationPreference(preference);
       const saved = saveConversationPreference(preference);
+      selectionMessage = saved ? '' : '当前聊天偏好未保存';
       verified = targetSignature(preference, picker()?.textContent || '');
       if (preference.effortState === 'unknown') {
         setBlock('unknown-effort', preference.modelKey, '当前强度尚未确认');
@@ -1890,7 +1980,7 @@
       status(preference.effortState === 'unknown'
         ? '已确认模型；' + (read.observedEffortLabel ? '已读取档位 ' + read.observedEffortLabel : '档位未识别')
         : '已确认');
-      if (!saved) status('页面已确认；当前标签页已记忆，但聊天偏好无法保存到浏览器');
+      if (!saved) status('当前聊天偏好未保存');
     }
 
     async function applyModelSelection(targetModel, check, initialState = null, onSelection = () => {}) {
@@ -2007,7 +2097,50 @@
       }
       if (working) return;
       if (isBusy()) {
+        if (panelUi && !panelSettings.collapsed && !hasFreshCatalog()) {
+          catalogWaiting = true;
+          renderPanel();
+        }
         schedule(1200);
+        return;
+      }
+
+      catalogWaiting = false;
+      if (panelUi && !panelSettings.collapsed && !hasFreshCatalog() && Date.now() >= catalogReadRetryAt) {
+        const epoch = serial, routeKey = key;
+        const check = () => cancellationCheck(epoch, routeKey);
+        const runToken = ++runSequence;
+        activeRunToken = runToken;
+        working = true;
+        catalogLoading = true;
+        catalogReadError = '';
+        renderPanel();
+        let loaded = false;
+        try {
+          await readCatalogOnly(check);
+          check();
+          const currentRead = readCurrentPreferenceFromNative(check);
+          acceptPageObservation(currentRead);
+          loaded = hasFreshCatalog();
+          if (!loaded) throw new Error('页面没有提供可读的模型列表');
+        } catch (error) {
+          if (scriptEnabled && pageActive && serial === epoch) {
+            catalogReadError = normalize(error?.message) || '读取失败';
+            catalogReadRetryAt = Date.now() + MODEL_CATALOG_RETRY_MS;
+            status('模型列表暂不可读');
+          }
+        } finally {
+          if (activeRunToken === runToken) {
+            if (scriptEnabled && pageActive && serial === epoch) await closeOwnedMenus(check);
+            catalogLoading = false;
+            catalogWaiting = false;
+            working = false;
+            activeRunToken = 0;
+            if (scriptEnabled && pageActive) renderPanel();
+          }
+        }
+        if (serial !== epoch) return;
+        schedule(loaded ? 0 : MODEL_CATALOG_RETRY_MS);
         return;
       }
 
@@ -2021,7 +2154,7 @@
         key,
         desired.modelKey,
         normalize(readNativeModelText(button)),
-        catalogContext === key ? catalogReadSignature : 'unobserved'
+        hasFreshCatalog() ? catalogReadSignature : 'unobserved'
       ].join('|');
       const epoch = serial, routeKey = key;
       const check = () => cancellationCheck(epoch, routeKey);
@@ -2050,7 +2183,6 @@
       activeRunToken = runToken;
       ownedMenu = false;
       userOwnsMenu = false;
-      let changedByScript = false;
       let preferenceSaveFailed = false;
       try {
         let menuState = null;
@@ -2078,10 +2210,10 @@
         let targetIdentity = { key: desired.modelKey, label: desired.modelLabel };
         let modelsMatch = modelIdentityMatches(targetIdentity, { key: actual.modelKey, label: actual.modelLabel });
         if (!modelsMatch) {
-          const cachedTarget = catalogContext === key ? findModel(catalog, desired) : null;
+          const cachedTarget = hasFreshCatalog() ? findModel(catalog, desired) : null;
           const cachedPermission = cachedTarget
             ? [cachedTarget.disabled, cachedTarget.reason, cachedTarget.availability?.state].join(':')
-            : catalogContext === key ? 'missing' : 'unobserved';
+            : hasFreshCatalog() ? 'missing' : 'unobserved';
           const cachedAttempt = [
             key, normalizedKey(panelModelLabel(desired.modelLabel)),
             normalizedKey(panelModelLabel(actual.modelLabel)), cachedPermission
@@ -2130,7 +2262,6 @@
             await applyModelSelection(targetModel, check, menuState, () => {
               attemptedModelSync = modelAttempt;
             });
-            changedByScript = true;
             read = readCurrentPreferenceFromNative(check);
             actual = acceptPageObservation(read);
             if (!actual || !modelIdentityMatches(
@@ -2163,39 +2294,46 @@
           const effortAttempt = [key, actual.modelKey, desired.effortKey].join('|');
           if (!effortBackend.available) {
             setBlock('backend-unavailable', effortAttempt, effortBackend.reason);
-            status('档位修改受阻：' + effortBackend.reason);
+            status('无法切换：' + effortBackend.reason);
           } else if (!isBlocked('effort-attempted', effortAttempt)) {
             const result = await writeEffortWithBackend(desired, check);
             if (!result.ok) {
               setBlock('effort-attempted', effortAttempt, result.reason);
-              status('档位修改受阻：' + result.reason);
+              status('无法切换：' + result.reason);
             } else {
               actual = result.preference;
+              read = result.read;
               confirmedPreference = actual;
               pageObservation = { ...result.read, preference: actual };
               updateEffortUi(actual.modelKey, result.read.effortState, result.read.observedEffortLabel);
-              if (!saveConversationPreference(actual)) preferenceSaveFailed = true;
-              if (requestedChoice) rememberConversationPreference(actual);
               clearBlock();
             }
           }
         }
 
-        if (requestedChoice && modelsMatch && requestedChoice.effortState === 'unknown') {
-          pendingChoice = null;
-          const confirmed = observedPreference(read);
-          if (confirmed) {
-            rememberConversationPreference(confirmed);
-            if (!saveConversationPreference(confirmed)) preferenceSaveFailed = true;
+        if (requestedChoice && modelIdentityMatches(actual, requestedChoice)) {
+          read = await readConfirmedPanelPreference(check, read);
+          actual = acceptPageObservation(read);
+          if (!actual || !modelIdentityMatches(actual, requestedChoice)) {
+            setBlock('model-unconfirmed', key, '等待页面确认面板选择');
+            status('等待页面确认面板选择');
+            return;
           }
-        }
-        if (changedByScript && requestedChoice?.effortState === 'unknown') {
-          pendingChoice = null;
-          const confirmed = observedPreference(read);
-          if (confirmed) {
-            rememberConversationPreference(confirmed);
-            if (!saveConversationPreference(confirmed)) preferenceSaveFailed = true;
+          const effortConfirmed = requestedChoice.effortState !== 'value' || preferenceMatches(actual, requestedChoice);
+          if (!effortConfirmed) {
+            setBlock('effort-unconfirmed', key, '强度状态未确认');
+            selectionMessage = '强度未确认，设置未保存';
+            status('等待页面确认强度');
+            return;
           }
+          pendingChoice = null;
+          const saved = saveConfirmedPanelPreference(actual);
+          if (!saved?.conversationSaved) preferenceSaveFailed = true;
+        } else if (requestedChoice) {
+          setBlock('model-unconfirmed', key, '等待页面确认面板选择');
+          selectionMessage = '页面尚未确认所选模型';
+          status('等待页面确认面板选择');
+          return;
         }
 
         verified = targetSignature(actual, picker()?.textContent || '');
@@ -2210,7 +2348,10 @@
             ? '已读取当前档位 ' + actual.observedEffortLabel + '；档位值尚未确认'
             : '已读取模型，档位未识别');
         }
-        if (preferenceSaveFailed) status('页面已确认；当前标签页已记忆，但聊天偏好无法保存到浏览器');
+        if (preferenceSaveFailed) {
+          selectionMessage = '当前聊天偏好未保存';
+          status('当前聊天偏好未保存');
+        }
       } catch (error) {
         if (!scriptEnabled || !pageActive || serial !== epoch || activeRunToken !== runToken) return;
         setBlock('failed', key + '|' + attemptedModelSync, error.message);
@@ -2268,6 +2409,8 @@
       confirmedPreference = null;
       pageObservation = null;
       catalog = []; catalogReadSignature = ''; catalogContext = key; catalogFresh = false;
+      catalogReadAt = 0; catalogReadRetryAt = 0; catalogLoading = false; catalogWaiting = false; catalogReadError = '';
+      selectionMessage = '';
       menuContexts = new WeakMap();
       effortOptions = []; effortModelKey = ''; effortObservedLabel = '';
       verified = ''; blocked = null; attemptedModelSync = ''; attemptedCatalogProbe = '';
@@ -2290,6 +2433,8 @@
       confirmedPreference = null;
       pageObservation = null;
       catalog = []; catalogReadSignature = ''; catalogContext = key; catalogFresh = false;
+      catalogReadAt = 0; catalogReadRetryAt = 0; catalogLoading = false; catalogWaiting = false; catalogReadError = '';
+      selectionMessage = '';
       menuContexts = new WeakMap();
       effortOptions = []; effortModelKey = ''; effortObservedLabel = '';
       verified = ''; blocked = null; attemptedModelSync = ''; attemptedCatalogProbe = '';
@@ -2347,6 +2492,7 @@
         if (!panelSettings.position) queuePanelPosition();
         const pickerChanged = notePickerChange();
         if (previousKey !== key || pickerChanged) schedule(250);
+        else if (!panelSettings.collapsed && !hasFreshCatalog() && Date.now() >= catalogReadRetryAt) schedule(0);
       }, 1500);
       renderPanel();
       observeVisibleModelCatalog();

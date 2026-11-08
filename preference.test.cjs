@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const {
   Preferences,
+  VERSION,
   context,
   resolveCurrentModelPreference,
   DEFAULT_PREFERENCE,
@@ -264,9 +265,12 @@ function fakeChatGPTWindow({
   enabled = null,
   currentModel = 'GPT-6',
   currentEffort = 'Medium',
+  currentEffortValue = 1,
+  effortSurface = true,
   buttonShowsModel = true,
   modelRows: rows = null,
   onModelClick = null,
+  pathname = '/c/test-chat',
   localStore = null
 } = {}) {
   const document = testDocument();
@@ -296,11 +300,25 @@ function fakeChatGPTWindow({
     { label: 'GPT-5.6 Sol', stableId: 'gpt-56' },
     { label: 'GPT-6', stableId: 'gpt-6' }
   ];
+  const addEffortSurface = target => {
+    const status = document.createElement('div');
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.textContent = currentEffort + '，第 ' + (currentEffortValue + 1) + ' 项，共 5 项。';
+    const slider = document.createElement('div');
+    slider.setAttribute('role', 'slider');
+    slider.setAttribute('aria-valuemin', '0');
+    slider.setAttribute('aria-valuemax', '4');
+    slider.setAttribute('aria-valuenow', String(currentEffortValue));
+    slider.setAttribute('aria-valuetext', currentEffort);
+    target.append(status, slider);
+  };
   picker.addEventListener('click', () => {
     if (menu) { removeMenu(); return; }
     menuOpenCount++;
     menu = document.createElement('div');
     menu.setAttribute('role', 'menu');
+    if (effortSurface) addEffortSurface(menu);
     const chooser = document.createElement('button');
     chooser.setAttribute('role', 'menuitem');
     chooser.setAttribute('aria-label', '选择模型');
@@ -405,6 +423,7 @@ function fakeChatGPTWindow({
     removeMenu
   });
   win.top = win.self = win;
+  win.location.pathname = pathname;
   Object.defineProperties(win, {
     observerCount: { get: () => observerCount },
     observers: { get: () => observers },
@@ -419,6 +438,23 @@ function fakeChatGPTWindow({
 function descendants(node) {
   return node.children.flatMap(child => [child, ...descendants(child)]);
 }
+
+function panelFor(win) {
+  return win.document.body.children.find(element => element.dataset.chatgptModelPanel).shadowRoot;
+}
+
+async function expandPanelAndWaitForCatalog(win, waitMs = 1800) {
+  panelFor(win).querySelector('.toggle').click(true);
+  await new Promise(resolve => setTimeout(resolve, waitMs));
+}
+
+test('用户脚本元数据、运行时标记和 README 版本保持一致', () => {
+  const source = fs.readFileSync('ChatGPT_56_Preference.user.js', 'utf8');
+  const readme = fs.readFileSync('README.md', 'utf8');
+  assert.equal(VERSION, '0.7.0');
+  assert.match(source, /^\/\/ @version\s+0\.7\.0$/m);
+  assert.match(readme, /^版本：0\.7\.0/m);
+});
 
 test('面板首次默认折叠，单独保存位置并读取', () => {
   const store = memory();
@@ -619,6 +655,141 @@ test('页面模型已与默认目标一致时不打开菜单或重复点击', as
     .shadowRoot.querySelector('.feature-switch').click(true);
 });
 
+test('展开面板后空闲读取模型目录，保留权限限制并禁用无写入接口的强度按钮', async () => {
+  const win = fakeChatGPTWindow({
+    currentModel: 'GPT-5.6 Sol',
+    modelRows: [
+      { label: 'GPT-5.6 Sol', stableId: 'gpt-56' },
+      { label: 'GPT-6', stableId: 'gpt-6', disabled: true, reason: '已达到使用限额' }
+    ]
+  });
+  const app = start(win);
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal(win.menuOpenCount, 0, '折叠面板不主动打开原生菜单');
+  assert.ok(panelFor(win).querySelectorAll('.model-choice').every(button => button.disabled));
+  assert.match(panelFor(win).querySelector('.model-note').textContent, /模型列表未读取/);
+
+  await expandPanelAndWaitForCatalog(win);
+  const shadow = panelFor(win);
+  assert.deepEqual(app.diagnostics.catalog.map(item => item.label), ['GPT-5.6 Sol', 'GPT-6']);
+  assert.equal(win.menuOpenCount, 1);
+  assert.equal(shadow.querySelectorAll('.model-choice')[0].disabled, false);
+  assert.equal(shadow.querySelectorAll('.model-choice')[1].disabled, true);
+  assert.match(shadow.querySelector('.model-note').textContent, /已达到使用限额/);
+  assert.ok(shadow.querySelectorAll('.effort-choice').every(button => button.disabled));
+  assert.match(shadow.querySelector('.effort-note').textContent, /未发现可确认的强度写入接口/);
+  assert.equal(win.document.querySelectorAll('[role="menu"]').length, 0, '只关闭脚本打开的菜单');
+
+  shadow.querySelector('.feature-switch').click(true);
+});
+
+test('用户打开的原生菜单会阻止展开面板的目录读取，脚本不关闭它', async () => {
+  const local = memory();
+  local.setItem(PANEL_KEY, JSON.stringify({ collapsed: false, position: null }));
+  const win = fakeChatGPTWindow({ currentModel: 'GPT-5.6 Sol', localStore: local });
+  const app = start(win);
+  win.picker.click(true);
+  await new Promise(resolve => setTimeout(resolve, 1700));
+  assert.equal(win.menuOpenCount, 1);
+  assert.equal(win.document.querySelectorAll('[role="menu"]').length, 1);
+  assert.equal(app.diagnostics.catalog.length, 0);
+
+  panelFor(win).querySelector('.feature-switch').click(true);
+  assert.equal(win.document.querySelectorAll('[role="menu"]').length, 1);
+  win.removeMenu();
+});
+
+test('面板确认模型后保存全局默认，新聊天继承且已有聊天保留自己的偏好', async () => {
+  const local = memory();
+  const previous = {
+    modelKey: 'label:gpt-5.6 sol', modelLabel: 'GPT-5.6 Sol',
+    effortKey: effortValueKey('label:gpt-5.6 sol', 1), effortLabel: 'Medium', effortState: 'value'
+  };
+  local.setItem(PREFIX + 'chat:test-chat', JSON.stringify(previous));
+  local.setItem(PREFIX + 'chat:existing', JSON.stringify(previous));
+  const win = fakeChatGPTWindow({ currentModel: 'GPT-5.6 Sol', localStore: local });
+  const app = start(win);
+  await expandPanelAndWaitForCatalog(win);
+
+  const modelButtons = panelFor(win).querySelectorAll('.model-choice');
+  modelButtons.find(button => button.textContent === 'GPT-6').click(true);
+  await new Promise(resolve => setTimeout(resolve, 2100));
+
+  const savedDefault = JSON.parse(local.getItem(PREFIX + 'default'));
+  const savedChat = JSON.parse(local.getItem(PREFIX + 'chat:test-chat'));
+  assert.equal(win.currentModel, 'GPT-6');
+  assert.equal(savedDefault.modelLabel, 'GPT-6');
+  assert.equal(savedDefault.effortState, 'value');
+  assert.equal(savedDefault.effortLabel, 'Medium');
+  assert.equal(savedChat.modelLabel, 'GPT-6');
+  assert.equal(savedChat.effortState, 'value');
+  assert.equal(panelFor(win).querySelector('.selection-note').textContent, '已记为新聊天默认');
+
+  const prefs = new Preferences(local, win.sessionStorage);
+  assert.equal(prefs.ensure('chat:new-chat').modelLabel, 'GPT-6');
+  assert.deepEqual(prefs.ensure('chat:existing'), previous);
+  panelFor(win).querySelector('.feature-switch').click(true);
+
+  const reload = fakeChatGPTWindow({ localStore: local, currentModel: 'GPT-5.6 Sol', pathname: '/c/new-chat' });
+  local.setItem(ENABLED_KEY, 'on');
+  start(reload);
+  await new Promise(resolve => setTimeout(resolve, 900));
+  assert.equal(reload.currentModel, 'GPT-6');
+  assert.equal(JSON.parse(local.getItem(PREFIX + 'chat:new-chat')).modelLabel, 'GPT-6');
+  panelFor(reload).querySelector('.feature-switch').click(true);
+});
+
+test('强度名称可见但页面未提供强度值时不覆盖新聊天默认', async () => {
+  const local = memory();
+  const originalDefault = {
+    modelKey: 'label:gpt-5.6 sol', modelLabel: 'GPT-5.6 Sol',
+    effortKey: effortValueKey('label:gpt-5.6 sol', 1), effortLabel: 'Medium', effortState: 'value'
+  };
+  local.setItem(PREFIX + 'default', JSON.stringify(originalDefault));
+  const win = fakeChatGPTWindow({ currentModel: 'GPT-5.6 Sol', localStore: local, effortSurface: false });
+  start(win);
+  await expandPanelAndWaitForCatalog(win);
+  panelFor(win).querySelectorAll('.model-choice').find(button => button.textContent === 'GPT-6').click(true);
+  await new Promise(resolve => setTimeout(resolve, 2100));
+
+  assert.equal(win.currentModel, 'GPT-6');
+  assert.deepEqual(JSON.parse(local.getItem(PREFIX + 'default')), originalDefault);
+  assert.equal(JSON.parse(local.getItem(PREFIX + 'chat:test-chat')).effortState, 'unknown');
+  assert.match(panelFor(win).querySelector('.selection-note').textContent, /强度未确认，新聊天默认未更改/);
+  panelFor(win).querySelector('.feature-switch').click(true);
+});
+
+test('面板确认后的两类存储失败分别提示，另一类写入仍可成功', async () => {
+  for (const failedKey of [PREFIX + 'default', PREFIX + 'chat:test-chat']) {
+    const values = new Map();
+    const localStore = {
+      getItem(key) { return values.has(key) ? values.get(key) : null; },
+      setItem(key, value) {
+        if (key === failedKey) throw new Error('quota exceeded');
+        values.set(key, String(value));
+      },
+      removeItem(key) { values.delete(key); }
+    };
+    const win = fakeChatGPTWindow({ currentModel: 'GPT-5.6 Sol', localStore });
+    start(win);
+    await expandPanelAndWaitForCatalog(win);
+    panelFor(win).querySelectorAll('.model-choice')[0].click(true);
+    await new Promise(resolve => setTimeout(resolve, 1900));
+
+    const note = panelFor(win).querySelector('.selection-note').textContent;
+    if (failedKey.endsWith(':default')) {
+      assert.equal(values.get(PREFIX + 'chat:test-chat') !== undefined, true);
+      assert.equal(values.has(PREFIX + 'default'), false);
+      assert.match(note, /新聊天默认未保存/);
+    } else {
+      assert.equal(values.has(PREFIX + 'chat:test-chat'), false);
+      assert.equal(values.has(PREFIX + 'default'), true);
+      assert.match(note, /当前聊天偏好未保存/);
+    }
+    panelFor(win).querySelector('.feature-switch').click(true);
+  }
+});
+
 test('用户在等待切换期间开始输入会取消后续脚本操作并让调度恢复', async () => {
   const win = fakeChatGPTWindow({
     currentModel: 'GPT-6',
@@ -644,8 +815,15 @@ test('用户在等待切换期间开始输入会取消后续脚本操作并让�
 });
 
 test('用户手动确认的模型在当前聊天优先于默认值并跨刷新保存', async () => {
+  const local = memory();
+  const originalDefault = {
+    modelKey: 'label:gpt-5.6 sol', modelLabel: 'GPT-5.6 Sol',
+    effortKey: effortValueKey('label:gpt-5.6 sol', 1), effortLabel: 'Medium', effortState: 'value'
+  };
+  local.setItem(PREFIX + 'default', JSON.stringify(originalDefault));
   const win = fakeChatGPTWindow({
     currentModel: 'GPT-5.6 Sol',
+    localStore: local,
     onModelClick: ({ window }) => window.setButtonShowsModel(false)
   });
   const app = start(win);
@@ -661,6 +839,7 @@ test('用户手动确认的模型在当前聊天优先于默认值并跨刷新�
   const stored = JSON.parse(win.localStorage.getItem(PREFIX + 'chat:test-chat'));
   assert.equal(stored.modelLabel, 'GPT-6');
   assert.equal(stored.effortState, 'unknown');
+  assert.deepEqual(JSON.parse(win.localStorage.getItem(PREFIX + 'default')), originalDefault);
   await app.reconcile();
   assert.equal(win.currentModel, 'GPT-6');
   win.document.body.children.find(element => element.dataset.chatgptModelPanel)
@@ -704,7 +883,7 @@ test('聊天偏好存储失败时当前标签页保留已确认模型且不被�
 
   assert.equal(win.currentModel, 'GPT-6');
   assert.equal(win.localStorage.getItem(PREFIX + 'chat:test-chat'), null);
-  assert.match(app.diagnostics.statusText, /无法保存到浏览器/);
+  assert.match(panelFor(win).querySelector('.selection-note').textContent, /当前聊天偏好未保存/);
   await app.reconcile();
   assert.equal(win.currentModel, 'GPT-6');
   win.document.body.children.find(element => element.dataset.chatgptModelPanel)
@@ -834,12 +1013,13 @@ test('展开面板实际渲染固定模型和强度按钮，并只按页面确�
 
   controls.update({
     catalog: [gpt56, gpt6],
+    catalogFresh: true,
     current,
     effortModelKey: current.modelKey,
     effortOptions: [medium],
     observedEffortLabel: 'Medium',
     writerAvailable: false,
-    writerReason: '未发现可确认的同源档位接口'
+    writerReason: '未发现可确认的强度写入接口'
   });
 
   assert.deepEqual([...controls.modelButtons.values()].map(button => button.textContent), ['GPT-5.6', 'GPT-6']);
@@ -849,9 +1029,9 @@ test('展开面板实际渲染固定模型和强度按钮，并只按页面确�
   assert.match(controls.modelNotice.textContent, /GPT-6：.*访问权限.*使用限额/);
   assert.equal(controls.effortButtons.get('medium').getAttribute('aria-pressed'), 'true');
   assert.equal(controls.effortButtons.get('medium').disabled, true);
-  assert.match(controls.effortNotice.textContent, /档位修改受阻/);
+  assert.match(controls.effortNotice.textContent, /无法切换/);
   assert.equal(controls.effortButtons.get('pro').disabled, true);
-  assert.match(controls.effortButtons.get('pro').title, /选项未确认/);
+  assert.match(controls.effortButtons.get('pro').title, /此档未确认/);
   assert.equal(descendants(controls.element).some(node => node.tagName === 'SELECT'), false);
 
   controls.modelButtons.get('gpt-6').click(true);
@@ -861,6 +1041,7 @@ test('展开面板实际渲染固定模型和强度按钮，并只按页面确�
 
   controls.update({
     catalog: [gpt56, gpt6],
+    catalogFresh: true,
     current: { ...current, effortLabel: 'Extra High', effortKey: effortValueKey(current.modelKey, 3) },
     effortModelKey: current.modelKey,
     effortOptions: [{ key: effortValueKey(current.modelKey, 3), value: 3, label: 'Extra High' }],
@@ -877,6 +1058,7 @@ test('展开面板实际渲染固定模型和强度按钮，并只按页面确�
 
   controls.update({
     catalog: [gpt56, gpt6],
+    catalogFresh: true,
     current: { ...current, effortLabel: 'Max', effortKey: effortValueKey(current.modelKey, 4) },
     effortModelKey: current.modelKey,
     effortOptions: [{ key: effortValueKey(current.modelKey, 4), value: 4, label: 'Max' }],
@@ -886,7 +1068,7 @@ test('展开面板实际渲染固定模型和强度按钮，并只按页面确�
   });
   assert.equal(controls.effortButtons.get('pro').getAttribute('aria-pressed'), 'false');
   assert.equal(controls.effortButtons.get('pro').disabled, true);
-  assert.match(controls.effortButtons.get('pro').title, /选项未确认/);
+  assert.match(controls.effortButtons.get('pro').title, /此档未确认/);
 });
 
 test('打开的原生模型菜单只读采集真实模型项目，不点击菜单或选项', () => {
@@ -1099,7 +1281,7 @@ test('后端适配器没有确认契约时明确阻塞，假的契约可验证�
   const reader = createEffortBackendAdapter({ async read() { return { ok: true }; } });
   assert.equal(reader.canRead, true);
   assert.equal(reader.canWrite, false);
-  assert.deepEqual(await reader.write({}), { ok: false, reason: '未发现可确认的同源档位接口' });
+  assert.deepEqual(await reader.write({}), { ok: false, reason: '未发现可确认的强度写入接口' });
 });
 
 test('写入只在页面于 5 秒内确认同一模型与档位后成功，失败时不提交偏好', async () => {
@@ -1194,7 +1376,7 @@ test('档位逻辑不再聚焦原生滑杆或派发合成方向键', () => {
   assert.doesNotMatch(effortReader, /parentElement|\.click\s*\(/);
   const passiveRead = source.slice(source.indexOf('function readCurrentPreferenceFromNative'), source.indexOf('function updateEffortUi'));
   assert.doesNotMatch(passiveRead, /\.click\s*\(/);
-  assert.match(source, /未发现可确认的同源档位接口/);
+  assert.match(source, /未发现可确认的强度写入接口/);
   const chooseEffort = source.slice(source.indexOf('function chooseEffort'), source.indexOf('function renderPanel'));
   assert.doesNotMatch(chooseEffort, /rememberConversationPreference/);
   const reconcile = source.slice(source.indexOf('async function reconcile'), source.indexOf("for (const type of ['pointerdown'"));
@@ -1315,7 +1497,7 @@ test('GPT-5.6 当前名称可见，但没有选项或写入契约时诚实地禁
   assert.deepEqual(row, {
     label: 'Medium',
     disabled: true,
-    title: '档位修改受阻：未发现可确认的同源档位接口'
+    title: '无法切换：未发现可确认的强度写入接口'
   });
 });
 
